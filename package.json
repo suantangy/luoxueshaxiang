@@ -1,0 +1,14 @@
+{
+  "name": "lx-source-sandbox",
+  "version": "1.0.0",
+  "description": "洛雪音源脚本沙箱检测：模拟 lx 运行时，执行 musicUrl 并探活",
+  "main": "sandbox-server.js",
+  "scripts": {
+    "start": "node sandbox-server.js",
+    "dev": "node sandbox-server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
