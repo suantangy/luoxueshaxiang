@@ -31,17 +31,19 @@ const PLATFORM_MAP = {
 };
 
 const TEST_BY_PLATFORM = {
-  wy: { ids: ["347230", "186016", "186001"] },
-  kw: { ids: ["291598", "164700", "96765035"] },
-  tx: { ids: ["004ZX0AQ49Bc8Y", "001yS0N33yPm1B", "0039MnYb0qxYhV"] },
+  wy: { ids: ["347230", "186016", "186001"], name: "海阔天空", singer: "Beyond" },
+  kw: { ids: ["291598", "164700", "96765035"], name: "隐形的翅膀", singer: "张韶涵" },
+  tx: { ids: ["004ZX0AQ49Bc8Y", "001yS0N33yPm1B", "0039MnYb0qxYhV"], name: "海阔天空", singer: "BEYOND" },
   kg: {
     ids: [
       "4d97c65307f81e2a34ea13f9ecb27f5a",
       "e5c40a31c3c16ba461f650035734c123",
       "b3a52a7a958bf0aed0ebfba2e9a818b7"
-    ]
+    ],
+    name: "隐形的翅膀",
+    singer: "张韶涵"
   },
-  mg: { ids: ["600929000006724407", "600913000009337537", "600902000006889366"] }
+  mg: { ids: ["600929000006724407", "600913000009337537", "600902000006889366"], name: "海阔天空", singer: "Beyond" }
 };
 
 // ---------- HTTP helpers ----------
@@ -227,17 +229,50 @@ async function probePlayable(playUrl) {
 }
 
 function buildMusicInfo(platform, id) {
+  const meta = TEST_BY_PLATFORM[platform] || {};
+  const sid = String(id);
+  // 尽量对齐落雪 musicInfo 常见字段，避免脚本报「无法获取歌曲ID」
   const info = {
-    name: "测试歌曲",
-    singer: "测试",
-    id: String(id),
-    songmid: String(id),
-    songId: String(id),
-    mid: String(id),
-    rid: String(id),
-    hash: platform === "kg" ? String(id) : "",
-    copyrightId: platform === "mg" ? String(id) : ""
+    name: meta.name || "海阔天空",
+    singer: meta.singer || "Beyond",
+    albumName: "测试专辑",
+    interval: 240,
+    id: sid,
+    songmid: sid,
+    songId: sid,
+    mid: sid,
+    rid: sid,
+    strMediaMid: sid,
+    media_mid: sid,
+    hash: platform === "kg" ? sid : sid,
+    copyrightId: platform === "mg" ? sid : sid,
+    contentId: platform === "mg" ? sid : sid,
+    // 部分源会读这些
+    albumId: sid,
+    source: platform
   };
+  if (platform === "kg") {
+    info.hash = sid;
+    info.kgHub = sid;
+  }
+  if (platform === "tx") {
+    info.songmid = sid;
+    info.mid = sid;
+    info.strMediaMid = sid;
+  }
+  if (platform === "kw") {
+    info.rid = sid;
+    info.songmid = sid;
+  }
+  if (platform === "wy") {
+    info.id = sid;
+    info.songId = sid;
+  }
+  if (platform === "mg") {
+    info.copyrightId = sid;
+    info.contentId = sid;
+    info.songmid = sid;
+  }
   return info;
 }
 
@@ -382,8 +417,8 @@ async function runScriptCheck(scriptText) {
     };
   }
 
-  // 等 inited（部分脚本异步拉配置）
-  await new Promise((r) => setTimeout(r, 800));
+  // 等 inited（部分脚本异步拉配置 / 强混淆初始化较慢）
+  await new Promise((r) => setTimeout(r, 1500));
 
   if (!requestHandler) {
     return {
@@ -411,49 +446,55 @@ async function runScriptCheck(scriptText) {
       return;
     }
     const ids = (TEST_BY_PLATFORM[platform] && TEST_BY_PLATFORM[platform].ids) || ["1"];
+    const qualities = ["128k", "320k", "flac"];
     const deadline = Date.now() + PLATFORM_TIMEOUT_MS;
     let lastErr = "取链失败";
     let tries = 0;
 
-    for (const id of ids) {
-      if (Date.now() > deadline || tries >= MAX_OUTBOUND_PER_PLATFORM) break;
-      tries++;
-      try {
-        const result = await Promise.race([
-          Promise.resolve(
-            requestHandler({
-              action: "musicUrl",
-              source: platform,
-              info: {
-                type: "128k",
-                musicInfo: buildMusicInfo(platform, id)
-              }
-            })
-          ),
-          new Promise((_, rej) =>
-            setTimeout(() => rej(new Error("musicUrl 超时")), PLATFORM_TIMEOUT_MS)
-          )
-        ]);
+    outer: for (const id of ids) {
+      for (const quality of qualities) {
+        if (Date.now() > deadline || tries >= MAX_OUTBOUND_PER_PLATFORM) break outer;
+        tries++;
+        try {
+          const result = await Promise.race([
+            Promise.resolve(
+              requestHandler({
+                action: "musicUrl",
+                source: platform,
+                info: {
+                  type: quality,
+                  musicInfo: buildMusicInfo(platform, id)
+                }
+              })
+            ),
+            new Promise((_, rej) =>
+              setTimeout(() => rej(new Error("musicUrl 超时")), PLATFORM_TIMEOUT_MS)
+            )
+          ]);
 
-        let playUrl = null;
-        if (typeof result === "string" && /^https?:\/\//i.test(result)) playUrl = result;
-        else if (result && typeof result === "object") playUrl = pickUrlFromBody(result);
+          let playUrl = null;
+          if (typeof result === "string" && /^https?:\/\//i.test(result)) playUrl = result;
+          else if (result && typeof result === "object") playUrl = pickUrlFromBody(result);
 
-        if (playUrl && (await probePlayable(playUrl))) {
-          platformStatus[platform] = "ok";
-          platformReasons[platform] = "已取到可播放音频地址";
-          return;
-        }
-        if (playUrl) {
-          lastErr = "返回了地址但音频探活失败";
-        } else {
-          lastErr = "未返回有效播放地址";
-        }
-      } catch (e) {
-        lastErr = e && e.message ? String(e.message).slice(0, 120) : "调用失败";
-        // 403 等环境限制：仍记失败，但文案标明
-        if (/403|Forbidden|地区|版权|IP/i.test(lastErr)) {
-          lastErr = "接口拒绝或地区限制: " + lastErr;
+          if (playUrl && (await probePlayable(playUrl))) {
+            platformStatus[platform] = "ok";
+            platformReasons[platform] = "已取到可播放音频地址";
+            return;
+          }
+          if (playUrl) {
+            lastErr = "返回了地址但音频探活失败";
+          } else {
+            lastErr = "未返回有效播放地址";
+          }
+        } catch (e) {
+          lastErr = e && e.message ? String(e.message).slice(0, 120) : "调用失败";
+          if (/403|Forbidden|地区|版权|IP/i.test(lastErr)) {
+            lastErr = "接口拒绝或地区限制: " + lastErr;
+          }
+          // 「无法获取歌曲ID」换下一个 id；音质不支持则换 quality
+          if (/无法获取歌曲ID|缺少歌曲ID|没有找到|无效的id/i.test(lastErr)) {
+            break; // 换下一首歌 id
+          }
         }
       }
     }
