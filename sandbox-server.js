@@ -45,7 +45,7 @@ const TEST_BY_PLATFORM = {
 };
 
 // ---------- HTTP helpers ----------
-function fetchRaw(url, options = {}) {
+function fetchOnce(url, options = {}) {
   return new Promise((resolve, reject) => {
     let parsed;
     try {
@@ -74,7 +74,7 @@ function fetchRaw(url, options = {}) {
           const buf = Buffer.concat(chunks);
           let body = buf;
           const ct = (res.headers["content-type"] || "").toLowerCase();
-          if (/json/.test(ct) || (buf[0] === 0x7b || buf[0] === 0x5b)) {
+          if (/json/.test(ct) || (buf.length && (buf[0] === 0x7b || buf[0] === 0x5b))) {
             try {
               body = JSON.parse(buf.toString("utf8"));
             } catch {
@@ -87,7 +87,8 @@ function fetchRaw(url, options = {}) {
             statusCode: res.statusCode,
             headers: res.headers,
             body,
-            raw: buf
+            raw: buf,
+            url
           });
         });
       }
@@ -103,6 +104,29 @@ function fetchRaw(url, options = {}) {
     }
     req.end();
   });
+}
+
+/** 跟随 301/302/303/307/308，最多 6 次（裤佬 php 中间页会跳真实音频） */
+async function fetchRaw(url, options = {}) {
+  let current = url;
+  let opts = { ...options };
+  let last = null;
+  for (let i = 0; i < 6; i++) {
+    last = await fetchOnce(current, opts);
+    const code = last.statusCode;
+    const loc = last.headers && (last.headers.location || last.headers.Location);
+    if (loc && code >= 300 && code < 400) {
+      try {
+        current = new URL(loc, current).href;
+      } catch {
+        break;
+      }
+      opts = { ...opts, method: "GET", body: undefined };
+      continue;
+    }
+    break;
+  }
+  return last;
 }
 
 function looksLikeAudio(headers, raw) {
@@ -157,27 +181,47 @@ function pickUrlFromBody(body) {
 
 async function probePlayable(playUrl) {
   if (!playUrl || !/^https?:\/\//i.test(playUrl)) return false;
-  try {
+  const tryOnce = async (headers) => {
     const res = await fetchRaw(playUrl, {
       method: "GET",
-      headers: {
-        "User-Agent": "lx-music-mobile/1.4.0",
-        Range: "bytes=0-64"
-      },
-      maxBody: 128
+      headers,
+      maxBody: 256 * 1024
     });
+    if (!res) return false;
+    // 最终已是音频
     if (res.statusCode >= 200 && res.statusCode < 400 && looksLikeAudio(res.headers, res.raw)) {
       return true;
     }
-    // 有的 CDN 不认 Range，再试一次小 GET
-    if (res.statusCode === 403 || res.statusCode === 416) {
-      const res2 = await fetchRaw(playUrl, {
+    // 中间接口返回 JSON 里再带 url
+    const nested = pickUrlFromBody(res.body);
+    if (nested && nested !== playUrl) {
+      const res2 = await fetchRaw(nested, {
         method: "GET",
-        headers: { "User-Agent": "lx-music-mobile/1.4.0" },
-        maxBody: 128
+        headers: {
+          "User-Agent": "lx-music-mobile/1.4.0",
+          Range: "bytes=0-64"
+        },
+        maxBody: 256
       });
-      return res2.statusCode >= 200 && res2.statusCode < 400 && looksLikeAudio(res2.headers, res2.raw);
+      if (res2 && res2.statusCode >= 200 && res2.statusCode < 400 && looksLikeAudio(res2.headers, res2.raw)) {
+        return true;
+      }
     }
+    // 大文件但 content-type 是 audio（只读了部分 body）
+    const ct = String((res.headers && res.headers["content-type"]) || "").toLowerCase();
+    if (res.statusCode >= 200 && res.statusCode < 400 && /audio|mpeg|mp4|m4a|ogg|flac|aac/.test(ct)) {
+      return true;
+    }
+    return false;
+  };
+  try {
+    if (await tryOnce({
+      "User-Agent": "lx-music-mobile/1.4.0",
+      Range: "bytes=0-64",
+      Referer: "https://www.kuwo.cn/"
+    })) return true;
+    if (await tryOnce({ "User-Agent": "lx-music-mobile/1.4.0" })) return true;
+    if (await tryOnce({ "User-Agent": "Mozilla/5.0" })) return true;
   } catch (_) {}
   return false;
 }
