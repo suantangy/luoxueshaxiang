@@ -14,6 +14,14 @@ const { URL } = require("url");
 const vm = require("vm");
 const crypto = require("crypto");
 
+// 防止野草等脚本初始化抛「服务器异常」拖垮整个进程 → Render 502
+process.on("uncaughtException", (err) => {
+  console.error("[sandbox] uncaughtException:", err && err.message);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("[sandbox] unhandledRejection:", err && (err.message || err));
+});
+
 const PORT = Number(process.env.PORT) || 3080;
 const SCRIPT_MAX = 2 * 1024 * 1024;
 const VM_TIMEOUT_MS = 10000;
@@ -350,6 +358,33 @@ async function runScriptCheck(scriptText) {
         if (typeof cb === "function") cb(err, null);
         return;
       }
+      const u = String(url);
+      // 野草等会在初始化时拉远程配置，失败会抛「服务器异常」并可能拖垮进程
+      // 给配置类接口返回可用占位，让 musicUrl 仍可继续测
+      // 配置/信息类：失败会让野草抛「服务器异常」；占位让进程活着并尽量声明五平台
+      if (/grass-source|source-info|\/info\/|vinfo|mirror\.com|97\.64\.|source-info\/l/i.test(u) && !/\/url\//i.test(u)) {
+        const mock = {
+          data: {
+            s: "kw|128k,320k,flac&kg|128k,320k,flac&tx|128k,320k,flac&wy|128k,320k,flac&mg|128k,320k,flac",
+            m: "",
+            lv: "0",
+            lu: "",
+            lh: ""
+          }
+        };
+        if (typeof cb === "function") {
+          setTimeout(
+            () =>
+              cb(null, {
+                body: mock,
+                statusCode: 200,
+                headers: { "content-type": "application/json" }
+              }),
+            0
+          );
+        }
+        return;
+      }
       const method = (options && options.method) || "GET";
       const headers = Object.assign(
         {
@@ -364,7 +399,7 @@ async function runScriptCheck(scriptText) {
           headers["Content-Type"] = "application/json";
         }
       }
-      fetchRaw(String(url), { method, headers, body, timeout: REQ_TIMEOUT_MS })
+      fetchRaw(u, { method, headers, body, timeout: REQ_TIMEOUT_MS })
         .then((res) => {
           if (typeof cb === "function") {
             cb(null, {
