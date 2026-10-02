@@ -655,7 +655,7 @@ async function runScriptCheck(scriptText) {
   const platformStatus = {};
   const platformReasons = {};
   // 方案 B：从当前脚本正文解析端点（仅脚本里出现过的）
-  const scriptEndpoints = parseScriptEndpoints(script);
+  const scriptEndpoints = parseScriptEndpoints(scriptText);
 
   async function testOnePlatform(platform) {
     if (declared.length && !declared.includes(platform)) {
