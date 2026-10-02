@@ -37,14 +37,6 @@ const PLATFORM_MAP = {
   wy: "网易云",
   mg: "咪咕"
 };
-// gdstudio / 星海 source 名（脚本探活失败后的公开接口兜底）
-const PUBLIC_SOURCE = {
-  wy: "netease",
-  tx: "tencent",
-  kw: "kuwo",
-  kg: "kugou",
-  mg: "migu"
-};
 
 const TEST_BY_PLATFORM = {
   wy: { ids: ["347230", "186016", "186001"], name: "海阔天空", singer: "Beyond" },
@@ -257,58 +249,172 @@ async function probePlayable(playUrl) {
   return false;
 }
 
-/**
- * 脚本 musicUrl 探活失败后：用公开取链接口再试一次（仍须探活成功才绿）
- * 主要提高网易等在机房环境下的真实可绿率（如 gdstudio → 126.net）
- */
-async function tryPublicApiFallback(platform, songId) {
-  const source = PUBLIC_SOURCE[platform] || platform;
-  const id = encodeURIComponent(String(songId));
-  const candidates = [
-    `https://music-api.gdstudio.xyz/api.php?types=url&source=${source}&id=${id}&br=128`,
-    `https://music-api.gdstudio.xyz/api.php?types=url&source=${source}&id=${id}&br=320`
-  ];
-  // 酷我：gdstudio 常不支持 kuwo，补 nxinxz 直出
-  if (platform === "kw") {
-    candidates.push(
-      `https://music.nxinxz.com/kw.php?id=${id}&level=standard&type=mp3`,
-      `http://music.nxinxz.com/kw.php?id=${id}&level=standard&type=mp3`
-    );
-  }
-  if (platform === "wy") {
-    candidates.push(
-      `https://music.nxinxz.com/wy.php?id=${id}&level=standard&type=mp3`,
-      `http://music.nxinxz.com/wy.php?id=${id}&level=standard&type=mp3`
-    );
+// 方案 B：只从「当前脚本正文」里抠出的端点（不用脚本外写死的公开 API）
+const XINGHAI_SOURCE = {
+  wy: "netease",
+  tx: "tencent",
+  kw: "kuwo",
+  kg: "kugou",
+  mg: "migu"
+};
+
+function parseScriptEndpoints(text) {
+  const endpoints = [];
+  const seen = new Set();
+  const add = (ep) => {
+    const key = [ep.kind, ep.platform, ep.base || "", ep.template || ""].join("|");
+    if (seen.has(key)) return;
+    seen.add(key);
+    endpoints.push(ep);
+  };
+  if (!text || text.length < 40) return endpoints;
+
+  // gdstudio / 星海 base（仅当脚本里出现）
+  const baseSet = new Set();
+  let m;
+  const gdRe = /https?:\/\/[a-z0-9.-]*gdstudio\.[a-z.]+\/api\.php/gi;
+  while ((m = gdRe.exec(text))) baseSet.add(m[0].split("?")[0].replace(/\/$/, ""));
+  const apiRe = /https?:\/\/music-api\.[a-z0-9.-]+\/api\.php/gi;
+  while ((m = apiRe.exec(text))) baseSet.add(m[0].split("?")[0].replace(/\/$/, ""));
+  const sayqzRe = /https?:\/\/music-dl\.sayqz\.com\/api\/?/gi;
+  while ((m = sayqzRe.exec(text))) baseSet.add(m[0].replace(/\/?$/, ""));
+  for (const base of baseSet) {
+    for (const p of CORE) {
+      add({
+        platform: p,
+        kind: "xinghai",
+        base,
+        source: XINGHAI_SOURCE[p]
+      });
+    }
   }
 
-  for (const apiUrl of candidates) {
+  // oiapi 等（脚本里写死的）
+  const m163 = text.match(/https?:\/\/oiapi\.net\/api\/Music_163/i);
+  if (m163) add({ platform: "wy", kind: "id", base: m163[0] });
+  const mKw = text.match(/https?:\/\/oiapi\.net\/api\/Kuwo/i);
+  if (mKw) add({ platform: "kw", kind: "search-kw", base: mKw[0] });
+  const mQq = text.match(/https?:\/\/oiapi\.net\/api\/QQ_Music/i);
+  if (mQq) add({ platform: "tx", kind: "search", base: mQq[0] });
+
+  // 明文 php 模板
+  const phpRe =
+    /https?:\/\/[^\s"'`<>\\]{8,180}?(?:\/|^)(?:kw|kg|tx|wy|mg|qq)\.php\?[^\s"'`<>\\]{0,120}/gi;
+  while ((m = phpRe.exec(text))) {
+    let u = m[0].replace(/[),;]+$/, "");
+    let platform = null;
+    if (/kw\.php/i.test(u)) platform = "kw";
+    else if (/kg\.php/i.test(u)) platform = "kg";
+    else if (/(?:tx|qq)\.php/i.test(u)) platform = "tx";
+    else if (/wy\.php/i.test(u)) platform = "wy";
+    else if (/mg\.php/i.test(u)) platform = "mg";
+    if (!platform) continue;
+    let template = u
+      .replace(/([?&]id=)[^&"'`]*/gi, "$1{id}")
+      .replace(/([?&]level=)[^&"'`]*/gi, "$1{level}");
+    if (!/\{id\}/.test(template)) {
+      template += (template.includes("?") ? "&" : "?") + "id={id}&level={level}";
+    }
+    add({ platform, kind: "php", template });
+  }
+
+  // 长青 haitangw
+  const htRe =
+    /https?:\/\/yinyue\.haitangw\.net\/(kg|qq|wy|kw|mg)\/[a-z0-9_]+\.php\?type=mp3&id=/gi;
+  while ((m = htRe.exec(text))) {
+    const map = { kg: "kg", qq: "tx", wy: "wy", kw: "kw", mg: "mg" };
+    const p = map[String(m[1]).toLowerCase()];
+    if (p) {
+      add({
+        platform: p,
+        kind: "php",
+        template: m[0] + "{id}&level={level}"
+      });
+    }
+  }
+
+  // 优先级：星海 > 含 nxinxz/haitang 的 php > 其它
+  const score = (ep) => {
+    const u = ep.base || ep.template || "";
+    if (ep.kind === "xinghai") return 0;
+    if (/nxinxz|haitangw/i.test(u)) return 1;
+    if (ep.kind === "php") return 2;
+    if (ep.kind === "id" || ep.kind === "search-kw") return 3;
+    return 4;
+  };
+  endpoints.sort((a, b) => score(a) - score(b));
+  return endpoints;
+}
+
+/** 测试「脚本正文里出现过的」单个端点 */
+async function tryScriptEndpoint(ep, platform) {
+  const meta = TEST_BY_PLATFORM[platform] || {};
+  const ids = (meta.ids || ["1"]).slice(0, 2);
+  const jobs = [];
+
+  if (ep.kind === "xinghai" && ep.base) {
+    let base = String(ep.base).replace(/\/$/, "");
     try {
-      const res = await fetchRaw(apiUrl, {
+      const u = new URL(base.includes("://") ? base : "https://" + base);
+      if (/gdstudio|api\.php/i.test(u.href)) {
+        base = u.origin + u.pathname.replace(/\/$/, "");
+      }
+    } catch (_) {}
+    const source = ep.source || XINGHAI_SOURCE[platform] || platform;
+    for (const id of ids) {
+      jobs.push(
+        `${base}?types=url&source=${encodeURIComponent(source)}&id=${encodeURIComponent(id)}&br=128`
+      );
+    }
+  } else if (ep.kind === "id" && ep.base) {
+    for (const id of ids) {
+      jobs.push(`${ep.base}?id=${encodeURIComponent(id)}`);
+    }
+  } else if (ep.kind === "search-kw" && ep.base) {
+    for (const kw of ["隐形的翅膀", "海阔天空", meta.name || "测试"]) {
+      jobs.push(
+        `${ep.base}?msg=${encodeURIComponent(kw)}&n=1&br=128`
+      );
+    }
+  } else if (ep.kind === "search" && ep.base) {
+    for (const id of ids) {
+      jobs.push(`${ep.base}?id=${encodeURIComponent(id)}`);
+    }
+  } else if (ep.kind === "php" && ep.template) {
+    const id = ids[0];
+    for (const level of ["standard", "128k"]) {
+      jobs.push(
+        ep.template
+          .replace(/\{id\}/gi, encodeURIComponent(id))
+          .replace(/\{level\}/gi, level)
+      );
+    }
+  }
+
+  for (const url of jobs.slice(0, 3)) {
+    try {
+      const res = await fetchRaw(url, {
         method: "GET",
         headers: {
           "User-Agent": "lx-music-mobile/1.4.0",
-          Accept: "application/json, */*"
+          Accept: "application/json, text/plain, */*, audio/*"
         },
         maxBody: 512 * 1024
       });
-      if (!res || res.statusCode >= 400) continue;
-
-      // 接口直接返回音频
-      if (looksLikeAudio(res.headers, res.raw)) {
-        return { ok: true, via: apiUrl };
+      if (!res) continue;
+      if (res.statusCode === 400) {
+        const t = res.raw ? res.raw.toString("utf8") : "";
+        if (/not supported|不支持/i.test(t)) break;
+        continue;
       }
-
-      let playUrl = pickUrlFromBody(res.body);
-      if (!playUrl && typeof res.body === "string" && /^https?:\/\//i.test(res.body.trim())) {
-        playUrl = res.body.trim();
-      }
-      if (playUrl && (await probePlayable(playUrl))) {
-        return { ok: true, via: "public:" + playUrl.slice(0, 60) };
+      if (res.statusCode >= 200 && res.statusCode < 400) {
+        if (looksLikeAudio(res.headers, res.raw)) return true;
+        const playUrl = pickUrlFromBody(res.body);
+        if (playUrl && (await probePlayable(playUrl))) return true;
       }
     } catch (_) {}
   }
-  return { ok: false };
+  return false;
 }
 
 function buildMusicInfo(platform, id) {
@@ -548,6 +654,8 @@ async function runScriptCheck(scriptText) {
 
   const platformStatus = {};
   const platformReasons = {};
+  // 方案 B：从当前脚本正文解析端点（仅脚本里出现过的）
+  const scriptEndpoints = parseScriptEndpoints(script);
 
   async function testOnePlatform(platform) {
     if (declared.length && !declared.includes(platform)) {
@@ -556,12 +664,29 @@ async function runScriptCheck(scriptText) {
       return;
     }
     const ids = (TEST_BY_PLATFORM[platform] && TEST_BY_PLATFORM[platform].ids) || ["1"];
-    // 先只测 128k，成功即停，避免 5 平台×3 音质拖过 Render/前端超时
-    const qualities = ["128k", "320k"];
-    const deadline = Date.now() + PLATFORM_TIMEOUT_MS;
     let lastErr = "取链失败";
-    let tries = 0;
 
+    // —— 1) 脚本内端点：失败换下一个，任一探活成功即绿 ——
+    const eps = scriptEndpoints.filter((e) => e.platform === platform).slice(0, 8);
+    for (const ep of eps) {
+      try {
+        if (await tryScriptEndpoint(ep, platform)) {
+          platformStatus[platform] = "ok";
+          platformReasons[platform] = "脚本内端点取链成功并已探活";
+          return;
+        }
+      } catch (_) {}
+    }
+    if (eps.length) {
+      lastErr = "脚本内端点均取链/探活失败";
+    } else {
+      lastErr = "脚本中未解析到该平台端点";
+    }
+
+    // —— 2) 仍失败则试 musicUrl（脚本运行时逻辑，也是脚本能力） ——
+    const qualities = ["128k"];
+    const deadline = Date.now() + PLATFORM_TIMEOUT_MS;
+    let tries = 0;
     outer: for (const id of ids) {
       for (const quality of qualities) {
         if (Date.now() > deadline || tries >= MAX_OUTBOUND_PER_PLATFORM) break outer;
@@ -589,38 +714,16 @@ async function runScriptCheck(scriptText) {
 
           if (playUrl && (await probePlayable(playUrl))) {
             platformStatus[platform] = "ok";
-            platformReasons[platform] = "已取到可播放音频地址";
+            platformReasons[platform] = "脚本 musicUrl 取链成功并已探活";
             return;
           }
-          // 严格：探活成功才绿；有地址但探活失败仍算失败
-          if (playUrl) {
-            lastErr = "返回了地址但音频探活失败";
-          } else {
-            lastErr = "未返回有效播放地址";
-          }
+          if (playUrl) lastErr = "返回了地址但音频探活失败";
+          else lastErr = lastErr || "未返回有效播放地址";
         } catch (e) {
           lastErr = e && e.message ? String(e.message).slice(0, 120) : "调用失败";
-          if (/403|Forbidden|地区|版权|IP/i.test(lastErr)) {
-            lastErr = "接口拒绝或地区限制: " + lastErr;
-          }
-          // 「无法获取歌曲ID」换下一个 id；音质不支持则换 quality
-          if (/无法获取歌曲ID|缺少歌曲ID|没有找到|无效的id/i.test(lastErr)) {
-            break; // 换下一首歌 id
-          }
+          if (/无法获取歌曲ID|缺少歌曲ID|没有找到|无效的id/i.test(lastErr)) break;
         }
       }
-    }
-
-    // 脚本链路失败 → 公开接口兜底（探活成功才绿）
-    for (const id of ids.slice(0, 2)) {
-      try {
-        const fb = await tryPublicApiFallback(platform, id);
-        if (fb.ok) {
-          platformStatus[platform] = "ok";
-          platformReasons[platform] = "公开接口兜底取链成功并已探活";
-          return;
-        }
-      } catch (_) {}
     }
 
     platformStatus[platform] = "fail";
