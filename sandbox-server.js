@@ -25,8 +25,8 @@ process.on("unhandledRejection", (err) => {
 const PORT = Number(process.env.PORT) || 3080;
 const SCRIPT_MAX = 2 * 1024 * 1024;
 const VM_TIMEOUT_MS = 10000;
-const REQ_TIMEOUT_MS = 12000;
-const PLATFORM_TIMEOUT_MS = 18000;
+const REQ_TIMEOUT_MS = 8000;
+const PLATFORM_TIMEOUT_MS = 12000;
 const MAX_OUTBOUND_PER_PLATFORM = 8;
 
 const CORE = ["kw", "kg", "tx", "wy", "mg"];
@@ -36,6 +36,14 @@ const PLATFORM_MAP = {
   tx: "QQ音乐",
   wy: "网易云",
   mg: "咪咕"
+};
+// gdstudio / 星海 source 名（脚本探活失败后的公开接口兜底）
+const PUBLIC_SOURCE = {
+  wy: "netease",
+  tx: "tencent",
+  kw: "kuwo",
+  kg: "kugou",
+  mg: "migu"
 };
 
 const TEST_BY_PLATFORM = {
@@ -225,15 +233,82 @@ async function probePlayable(playUrl) {
     return false;
   };
   try {
-    if (await tryOnce({
-      "User-Agent": "lx-music-mobile/1.4.0",
-      Range: "bytes=0-64",
-      Referer: "https://www.kuwo.cn/"
-    })) return true;
-    if (await tryOnce({ "User-Agent": "lx-music-mobile/1.4.0" })) return true;
-    if (await tryOnce({ "User-Agent": "Mozilla/5.0" })) return true;
+    const headerSets = [
+      {
+        "User-Agent": "lx-music-mobile/1.4.0",
+        Range: "bytes=0-64",
+        Referer: "https://www.kuwo.cn/"
+      },
+      { "User-Agent": "lx-music-mobile/1.4.0", Range: "bytes=0-64" },
+      { "User-Agent": "Mozilla/5.0", Range: "bytes=0-64" }
+    ];
+    // 网易 CDN 常用 Referer
+    if (/126\.net|music\.163\.com/i.test(playUrl)) {
+      headerSets.unshift({
+        "User-Agent": "Mozilla/5.0",
+        Referer: "https://music.163.com/",
+        Range: "bytes=0-64"
+      });
+    }
+    for (const h of headerSets) {
+      if (await tryOnce(h)) return true;
+    }
   } catch (_) {}
   return false;
+}
+
+/**
+ * 脚本 musicUrl 探活失败后：用公开取链接口再试一次（仍须探活成功才绿）
+ * 主要提高网易等在机房环境下的真实可绿率（如 gdstudio → 126.net）
+ */
+async function tryPublicApiFallback(platform, songId) {
+  const source = PUBLIC_SOURCE[platform] || platform;
+  const id = encodeURIComponent(String(songId));
+  const candidates = [
+    `https://music-api.gdstudio.xyz/api.php?types=url&source=${source}&id=${id}&br=128`,
+    `https://music-api.gdstudio.xyz/api.php?types=url&source=${source}&id=${id}&br=320`
+  ];
+  // 酷我：gdstudio 常不支持 kuwo，补 nxinxz 直出
+  if (platform === "kw") {
+    candidates.push(
+      `https://music.nxinxz.com/kw.php?id=${id}&level=standard&type=mp3`,
+      `http://music.nxinxz.com/kw.php?id=${id}&level=standard&type=mp3`
+    );
+  }
+  if (platform === "wy") {
+    candidates.push(
+      `https://music.nxinxz.com/wy.php?id=${id}&level=standard&type=mp3`,
+      `http://music.nxinxz.com/wy.php?id=${id}&level=standard&type=mp3`
+    );
+  }
+
+  for (const apiUrl of candidates) {
+    try {
+      const res = await fetchRaw(apiUrl, {
+        method: "GET",
+        headers: {
+          "User-Agent": "lx-music-mobile/1.4.0",
+          Accept: "application/json, */*"
+        },
+        maxBody: 512 * 1024
+      });
+      if (!res || res.statusCode >= 400) continue;
+
+      // 接口直接返回音频
+      if (looksLikeAudio(res.headers, res.raw)) {
+        return { ok: true, via: apiUrl };
+      }
+
+      let playUrl = pickUrlFromBody(res.body);
+      if (!playUrl && typeof res.body === "string" && /^https?:\/\//i.test(res.body.trim())) {
+        playUrl = res.body.trim();
+      }
+      if (playUrl && (await probePlayable(playUrl))) {
+        return { ok: true, via: "public:" + playUrl.slice(0, 60) };
+      }
+    } catch (_) {}
+  }
+  return { ok: false };
 }
 
 function buildMusicInfo(platform, id) {
@@ -481,7 +556,8 @@ async function runScriptCheck(scriptText) {
       return;
     }
     const ids = (TEST_BY_PLATFORM[platform] && TEST_BY_PLATFORM[platform].ids) || ["1"];
-    const qualities = ["128k", "320k", "flac"];
+    // 先只测 128k，成功即停，避免 5 平台×3 音质拖过 Render/前端超时
+    const qualities = ["128k", "320k"];
     const deadline = Date.now() + PLATFORM_TIMEOUT_MS;
     let lastErr = "取链失败";
     let tries = 0;
@@ -516,6 +592,7 @@ async function runScriptCheck(scriptText) {
             platformReasons[platform] = "已取到可播放音频地址";
             return;
           }
+          // 严格：探活成功才绿；有地址但探活失败仍算失败
           if (playUrl) {
             lastErr = "返回了地址但音频探活失败";
           } else {
@@ -532,6 +609,18 @@ async function runScriptCheck(scriptText) {
           }
         }
       }
+    }
+
+    // 脚本链路失败 → 公开接口兜底（探活成功才绿）
+    for (const id of ids.slice(0, 2)) {
+      try {
+        const fb = await tryPublicApiFallback(platform, id);
+        if (fb.ok) {
+          platformStatus[platform] = "ok";
+          platformReasons[platform] = "公开接口兜底取链成功并已探活";
+          return;
+        }
+      } catch (_) {}
     }
 
     platformStatus[platform] = "fail";
