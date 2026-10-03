@@ -2,7 +2,7 @@
  * 洛雪音源沙箱检测服务（可部署 Render / 本机）
  * - mock globalThis.lx，执行用户脚本
  * - 对 kw/kg/tx/wy/mg 调用 musicUrl
- * - 拦截 request / 返回值，探活音频地址
+ * - 只判断 musicUrl 是否返回有效播放地址
  *
  * POST /sandbox/check  { "script": "...", "name": "可选" }
  * GET  /health
@@ -14,15 +14,20 @@ const { URL } = require("url");
 const vm = require("vm");
 const crypto = require("crypto");
 
-// 防止野草等脚本初始化抛「服务器异常」拖垮整个进程 → Render 502
+// 防止脚本初始化异常导致整个进程退出
 process.on("uncaughtException", (err) => {
   console.error("[sandbox] uncaughtException:", err && err.message);
 });
+
 process.on("unhandledRejection", (err) => {
-  console.error("[sandbox] unhandledRejection:", err && (err.message || err));
+  console.error(
+    "[sandbox] unhandledRejection:",
+    err && (err.message || err)
+  );
 });
 
 const PORT = Number(process.env.PORT) || 3080;
+
 const SCRIPT_MAX = 2 * 1024 * 1024;
 const VM_TIMEOUT_MS = 10000;
 const REQ_TIMEOUT_MS = 8000;
@@ -30,6 +35,7 @@ const PLATFORM_TIMEOUT_MS = 12000;
 const MAX_OUTBOUND_PER_PLATFORM = 8;
 
 const CORE = ["kw", "kg", "tx", "wy", "mg"];
+
 const PLATFORM_MAP = {
   kw: "酷我",
   kg: "酷狗",
@@ -38,10 +44,31 @@ const PLATFORM_MAP = {
   mg: "咪咕"
 };
 
+// 每个平台准备多个测试 ID。
+// 如果第一个 ID 失败，会继续测试后面的 ID。
 const TEST_BY_PLATFORM = {
-  wy: { ids: ["347230", "186016", "186001"], name: "海阔天空", singer: "Beyond" },
-  kw: { ids: ["291598", "164700", "96765035"], name: "隐形的翅膀", singer: "张韶涵" },
-  tx: { ids: ["004ZX0AQ49Bc8Y", "001yS0N33yPm1B", "0039MnYb0qxYhV"], name: "海阔天空", singer: "BEYOND" },
+  wy: {
+    ids: ["347230", "186016", "186001"],
+    name: "海阔天空",
+    singer: "Beyond"
+  },
+
+  kw: {
+    ids: ["291598", "164700", "96765035"],
+    name: "隐形的翅膀",
+    singer: "张韶涵"
+  },
+
+  tx: {
+    ids: [
+      "004ZX0AQ49Bc8Y",
+      "001yS0N33yPm1B",
+      "0039MnYb0qxYhV"
+    ],
+    name: "海阔天空",
+    singer: "BEYOND"
+  },
+
   kg: {
     ids: [
       "4d97c65307f81e2a34ea13f9ecb27f5a",
@@ -51,48 +78,106 @@ const TEST_BY_PLATFORM = {
     name: "隐形的翅膀",
     singer: "张韶涵"
   },
-  mg: { ids: ["600929000006724407", "600913000009337537", "600902000006889366"], name: "海阔天空", singer: "Beyond" }
+
+  mg: {
+    ids: [
+      "600929000006724407",
+      "600913000009337537",
+      "600902000006889366"
+    ],
+    name: "海阔天空",
+    singer: "Beyond"
+  }
 };
 
-// ---------- HTTP helpers ----------
+
+// ============================================================
+// HTTP 请求
+// ============================================================
+
 function fetchOnce(url, options = {}) {
   return new Promise((resolve, reject) => {
     let parsed;
+
     try {
       parsed = new URL(url);
     } catch (e) {
       return reject(new Error("无效 URL"));
     }
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+
+    if (
+      parsed.protocol !== "http:" &&
+      parsed.protocol !== "https:"
+    ) {
       return reject(new Error("仅允许 http/https"));
     }
-    const lib = parsed.protocol === "https:" ? https : http;
+
+    const lib =
+      parsed.protocol === "https:"
+        ? https
+        : http;
+
     const req = lib.request(
       url,
       {
         method: options.method || "GET",
         headers: options.headers || {},
         timeout: options.timeout || REQ_TIMEOUT_MS,
+
+        // 某些第三方音乐接口证书可能不完整
         rejectUnauthorized: false
       },
+
       (res) => {
         const chunks = [];
+        let total = 0;
+
         res.on("data", (c) => {
-          if (Buffer.concat(chunks).length < (options.maxBody || 512 * 1024)) chunks.push(c);
+          const maxBody =
+            options.maxBody || 512 * 1024;
+
+          if (total < maxBody) {
+            chunks.push(c);
+            total += c.length;
+          }
         });
+
         res.on("end", () => {
           const buf = Buffer.concat(chunks);
+
           let body = buf;
-          const ct = (res.headers["content-type"] || "").toLowerCase();
-          if (/json/.test(ct) || (buf.length && (buf[0] === 0x7b || buf[0] === 0x5b))) {
+
+          const ct = String(
+            res.headers["content-type"] || ""
+          ).toLowerCase();
+
+          // JSON
+          if (
+            /json/.test(ct) ||
+            (
+              buf.length &&
+              (
+                buf[0] === 0x7b ||
+                buf[0] === 0x5b
+              )
+            )
+          ) {
             try {
-              body = JSON.parse(buf.toString("utf8"));
+              body = JSON.parse(
+                buf.toString("utf8")
+              );
             } catch {
               body = buf.toString("utf8");
             }
-          } else if (/text|javascript|xml/.test(ct)) {
+          }
+
+          // 文本
+          else if (
+            /text|javascript|xml/.test(ct)
+          ) {
             body = buf.toString("utf8");
           }
+
           resolve({
             statusCode: res.statusCode,
             headers: res.headers,
@@ -103,745 +188,1537 @@ function fetchOnce(url, options = {}) {
         });
       }
     );
+
     req.on("error", reject);
+
     req.on("timeout", () => {
       req.destroy();
       reject(new Error("请求超时"));
     });
+
     if (options.body) {
-      const b = typeof options.body === "string" ? options.body : JSON.stringify(options.body);
+      const b =
+        typeof options.body === "string"
+          ? options.body
+          : JSON.stringify(options.body);
+
       req.write(b);
     }
+
     req.end();
   });
 }
 
-/** 跟随 301/302/303/307/308，最多 6 次（裤佬 php 中间页会跳真实音频） */
+
+// ============================================================
+// 自动跟随重定向
+// ============================================================
+
 async function fetchRaw(url, options = {}) {
   let current = url;
   let opts = { ...options };
+
   let last = null;
+
+  // 最多跟随 6 次
   for (let i = 0; i < 6; i++) {
     last = await fetchOnce(current, opts);
+
     const code = last.statusCode;
-    const loc = last.headers && (last.headers.location || last.headers.Location);
-    if (loc && code >= 300 && code < 400) {
+
+    const loc =
+      last.headers &&
+      (
+        last.headers.location ||
+        last.headers.Location
+      );
+
+    if (
+      loc &&
+      code >= 300 &&
+      code < 400
+    ) {
       try {
-        current = new URL(loc, current).href;
+        current = new URL(
+          loc,
+          current
+        ).href;
       } catch {
         break;
       }
-      opts = { ...opts, method: "GET", body: undefined };
+
+      opts = {
+        ...opts,
+        method: "GET",
+        body: undefined
+      };
+
       continue;
     }
+
     break;
   }
+
   return last;
 }
 
-function looksLikeAudio(headers, raw) {
-  const ct = String((headers && headers["content-type"]) || "").toLowerCase();
-  if (/audio|mpeg|mp4|m4a|ogg|flac|aac|binary|octet-stream/.test(ct)) {
-    if (raw && raw.length >= 4) {
-      // ID3 / ftyp / fLaC / OggS
-      const h = raw.slice(0, 12);
-      if (
-        h[0] === 0xff ||
-        (h[0] === 0x49 && h[1] === 0x44 && h[2] === 0x33) ||
-        h.toString("ascii", 4, 8) === "ftyp" ||
-        h.toString("ascii", 0, 4) === "fLaC" ||
-        h.toString("ascii", 0, 4) === "OggS"
-      ) {
-        return true;
-      }
-      if (/audio|mpeg|mp4|m4a/.test(ct)) return true;
-    } else if (/audio|mpeg|mp4|m4a/.test(ct)) return true;
-  }
-  if (raw && raw.length >= 3) {
-    if (raw[0] === 0xff && (raw[1] & 0xe0) === 0xe0) return true;
-    if (raw[0] === 0x49 && raw[1] === 0x44 && raw[2] === 0x33) return true;
-  }
-  return false;
-}
+
+// ============================================================
+// 从接口返回内容中寻找播放 URL
+// ============================================================
 
 function pickUrlFromBody(body) {
   if (!body) return null;
+
+  // 字符串
   if (typeof body === "string") {
     const t = body.trim();
-    if (/^https?:\/\//i.test(t)) return t.split(/\s/)[0];
+
+    // 直接就是 URL
+    if (/^https?:\/\//i.test(t)) {
+      return t.split(/\s/)[0];
+    }
+
+    // JSON 字符串
     try {
       const j = JSON.parse(t);
+
       return pickUrlFromBody(j);
     } catch {
-      const m = t.match(/https?:\/\/[^\s"'<>]+/i);
+      // 普通文本中寻找 URL
+      const m = t.match(
+        /https?:\/\/[^\s"'<>]+/i
+      );
+
       return m ? m[0] : null;
     }
   }
-  if (typeof body === "object") {
-    for (const k of ["url", "music_url", "musicUrl", "src", "playUrl", "audioUrl"]) {
-      if (body[k] && /^https?:\/\//i.test(String(body[k]))) return String(body[k]);
+
+  // 对象
+  if (
+    typeof body === "object" &&
+    body !== null
+  ) {
+    // 常见 URL 字段
+    for (
+      const k of [
+        "url",
+        "music_url",
+        "musicUrl",
+        "src",
+        "playUrl",
+        "audioUrl"
+      ]
+    ) {
+      if (
+        body[k] &&
+        /^https?:\/\//i.test(
+          String(body[k])
+        )
+      ) {
+        return String(body[k]);
+      }
     }
+
+    // data 嵌套
     if (body.data) {
-      const u = pickUrlFromBody(body.data);
+      const u =
+        pickUrlFromBody(body.data);
+
+      if (u) return u;
+    }
+
+    // result 嵌套
+    if (body.result) {
+      const u =
+        pickUrlFromBody(body.result);
+
+      if (u) return u;
+    }
+
+    // song 嵌套
+    if (body.song) {
+      const u =
+        pickUrlFromBody(body.song);
+
       if (u) return u;
     }
   }
+
   return null;
 }
 
-async function probePlayable(playUrl) {
-  if (!playUrl || !/^https?:\/\//i.test(playUrl)) return false;
-  const tryOnce = async (headers) => {
-    const res = await fetchRaw(playUrl, {
-      method: "GET",
-      headers,
-      maxBody: 256 * 1024
-    });
-    if (!res) return false;
-    // 最终已是音频
-    if (res.statusCode >= 200 && res.statusCode < 400 && looksLikeAudio(res.headers, res.raw)) {
-      return true;
-    }
-    // 中间接口返回 JSON 里再带 url
-    const nested = pickUrlFromBody(res.body);
-    if (nested && nested !== playUrl) {
-      const res2 = await fetchRaw(nested, {
-        method: "GET",
-        headers: {
-          "User-Agent": "lx-music-mobile/1.4.0",
-          Range: "bytes=0-64"
-        },
-        maxBody: 256
-      });
-      if (res2 && res2.statusCode >= 200 && res2.statusCode < 400 && looksLikeAudio(res2.headers, res2.raw)) {
-        return true;
-      }
-    }
-    // 大文件但 content-type 是 audio（只读了部分 body）
-    const ct = String((res.headers && res.headers["content-type"]) || "").toLowerCase();
-    if (res.statusCode >= 200 && res.statusCode < 400 && /audio|mpeg|mp4|m4a|ogg|flac|aac/.test(ct)) {
-      return true;
-    }
-    return false;
-  };
-  try {
-    const headerSets = [
-      {
-        "User-Agent": "lx-music-mobile/1.4.0",
-        Range: "bytes=0-64",
-        Referer: "https://www.kuwo.cn/"
-      },
-      { "User-Agent": "lx-music-mobile/1.4.0", Range: "bytes=0-64" },
-      { "User-Agent": "Mozilla/5.0", Range: "bytes=0-64" }
-    ];
-    // 网易 CDN 常用 Referer
-    if (/126\.net|music\.163\.com/i.test(playUrl)) {
-      headerSets.unshift({
-        "User-Agent": "Mozilla/5.0",
-        Referer: "https://music.163.com/",
-        Range: "bytes=0-64"
-      });
-    }
-    for (const h of headerSets) {
-      if (await tryOnce(h)) return true;
-    }
-  } catch (_) {}
-  return false;
-}
 
-// 方案 B：只从「当前脚本正文」里抠出的端点（不用脚本外写死的公开 API）
-const XINGHAI_SOURCE = {
-  wy: "netease",
-  tx: "tencent",
-  kw: "kuwo",
-  kg: "kugou",
-  mg: "migu"
-};
-
-function parseScriptEndpoints(text) {
-  const endpoints = [];
-  const seen = new Set();
-  const add = (ep) => {
-    const key = [ep.kind, ep.platform, ep.base || "", ep.template || ""].join("|");
-    if (seen.has(key)) return;
-    seen.add(key);
-    endpoints.push(ep);
-  };
-  if (!text || text.length < 40) return endpoints;
-
-  // gdstudio / 星海 base（仅当脚本里出现）
-  const baseSet = new Set();
-  let m;
-  const gdRe = /https?:\/\/[a-z0-9.-]*gdstudio\.[a-z.]+\/api\.php/gi;
-  while ((m = gdRe.exec(text))) baseSet.add(m[0].split("?")[0].replace(/\/$/, ""));
-  const apiRe = /https?:\/\/music-api\.[a-z0-9.-]+\/api\.php/gi;
-  while ((m = apiRe.exec(text))) baseSet.add(m[0].split("?")[0].replace(/\/$/, ""));
-  const sayqzRe = /https?:\/\/music-dl\.sayqz\.com\/api\/?/gi;
-  while ((m = sayqzRe.exec(text))) baseSet.add(m[0].replace(/\/?$/, ""));
-  for (const base of baseSet) {
-    for (const p of CORE) {
-      add({
-        platform: p,
-        kind: "xinghai",
-        base,
-        source: XINGHAI_SOURCE[p]
-      });
-    }
-  }
-
-  // oiapi 等（脚本里写死的）
-  const m163 = text.match(/https?:\/\/oiapi\.net\/api\/Music_163/i);
-  if (m163) add({ platform: "wy", kind: "id", base: m163[0] });
-  const mKw = text.match(/https?:\/\/oiapi\.net\/api\/Kuwo/i);
-  if (mKw) add({ platform: "kw", kind: "search-kw", base: mKw[0] });
-  const mQq = text.match(/https?:\/\/oiapi\.net\/api\/QQ_Music/i);
-  if (mQq) add({ platform: "tx", kind: "search", base: mQq[0] });
-
-  // 明文 php 模板
-  const phpRe =
-    /https?:\/\/[^\s"'`<>\\]{8,180}?(?:\/|^)(?:kw|kg|tx|wy|mg|qq)\.php\?[^\s"'`<>\\]{0,120}/gi;
-  while ((m = phpRe.exec(text))) {
-    let u = m[0].replace(/[),;]+$/, "");
-    let platform = null;
-    if (/kw\.php/i.test(u)) platform = "kw";
-    else if (/kg\.php/i.test(u)) platform = "kg";
-    else if (/(?:tx|qq)\.php/i.test(u)) platform = "tx";
-    else if (/wy\.php/i.test(u)) platform = "wy";
-    else if (/mg\.php/i.test(u)) platform = "mg";
-    if (!platform) continue;
-    let template = u
-      .replace(/([?&]id=)[^&"'`]*/gi, "$1{id}")
-      .replace(/([?&]level=)[^&"'`]*/gi, "$1{level}");
-    if (!/\{id\}/.test(template)) {
-      template += (template.includes("?") ? "&" : "?") + "id={id}&level={level}";
-    }
-    add({ platform, kind: "php", template });
-  }
-
-  // 长青 haitangw
-  const htRe =
-    /https?:\/\/yinyue\.haitangw\.net\/(kg|qq|wy|kw|mg)\/[a-z0-9_]+\.php\?type=mp3&id=/gi;
-  while ((m = htRe.exec(text))) {
-    const map = { kg: "kg", qq: "tx", wy: "wy", kw: "kw", mg: "mg" };
-    const p = map[String(m[1]).toLowerCase()];
-    if (p) {
-      add({
-        platform: p,
-        kind: "php",
-        template: m[0] + "{id}&level={level}"
-      });
-    }
-  }
-
-  // 优先级：星海 > 含 nxinxz/haitang 的 php > 其它
-  const score = (ep) => {
-    const u = ep.base || ep.template || "";
-    if (ep.kind === "xinghai") return 0;
-    if (/nxinxz|haitangw/i.test(u)) return 1;
-    if (ep.kind === "php") return 2;
-    if (ep.kind === "id" || ep.kind === "search-kw") return 3;
-    return 4;
-  };
-  endpoints.sort((a, b) => score(a) - score(b));
-  return endpoints;
-}
-
-/** 测试「脚本正文里出现过的」单个端点 */
-async function tryScriptEndpoint(ep, platform) {
-  const meta = TEST_BY_PLATFORM[platform] || {};
-  const ids = (meta.ids || ["1"]).slice(0, 2);
-  const jobs = [];
-
-  if (ep.kind === "xinghai" && ep.base) {
-    let base = String(ep.base).replace(/\/$/, "");
-    try {
-      const u = new URL(base.includes("://") ? base : "https://" + base);
-      if (/gdstudio|api\.php/i.test(u.href)) {
-        base = u.origin + u.pathname.replace(/\/$/, "");
-      }
-    } catch (_) {}
-    const source = ep.source || XINGHAI_SOURCE[platform] || platform;
-    for (const id of ids) {
-      jobs.push(
-        `${base}?types=url&source=${encodeURIComponent(source)}&id=${encodeURIComponent(id)}&br=128`
-      );
-    }
-  } else if (ep.kind === "id" && ep.base) {
-    for (const id of ids) {
-      jobs.push(`${ep.base}?id=${encodeURIComponent(id)}`);
-    }
-  } else if (ep.kind === "search-kw" && ep.base) {
-    for (const kw of ["隐形的翅膀", "海阔天空", meta.name || "测试"]) {
-      jobs.push(
-        `${ep.base}?msg=${encodeURIComponent(kw)}&n=1&br=128`
-      );
-    }
-  } else if (ep.kind === "search" && ep.base) {
-    for (const id of ids) {
-      jobs.push(`${ep.base}?id=${encodeURIComponent(id)}`);
-    }
-  } else if (ep.kind === "php" && ep.template) {
-    const id = ids[0];
-    for (const level of ["standard", "128k"]) {
-      jobs.push(
-        ep.template
-          .replace(/\{id\}/gi, encodeURIComponent(id))
-          .replace(/\{level\}/gi, level)
-      );
-    }
-  }
-
-  for (const url of jobs.slice(0, 3)) {
-    try {
-      const res = await fetchRaw(url, {
-        method: "GET",
-        headers: {
-          "User-Agent": "lx-music-mobile/1.4.0",
-          Accept: "application/json, text/plain, */*, audio/*"
-        },
-        maxBody: 512 * 1024
-      });
-      if (!res) continue;
-      if (res.statusCode === 400) {
-        const t = res.raw ? res.raw.toString("utf8") : "";
-        if (/not supported|不支持/i.test(t)) break;
-        continue;
-      }
-      if (res.statusCode >= 200 && res.statusCode < 400) {
-        if (looksLikeAudio(res.headers, res.raw)) return true;
-        const playUrl = pickUrlFromBody(res.body);
-        if (playUrl && (await probePlayable(playUrl))) return true;
-      }
-    } catch (_) {}
-  }
-  return false;
-}
+// ============================================================
+// 构造模拟 musicInfo
+// ============================================================
 
 function buildMusicInfo(platform, id) {
-  const meta = TEST_BY_PLATFORM[platform] || {};
+  const meta =
+    TEST_BY_PLATFORM[platform] || {};
+
   const sid = String(id);
-  // 尽量对齐落雪 musicInfo 常见字段，避免脚本报「无法获取歌曲ID」
+
   const info = {
-    name: meta.name || "海阔天空",
-    singer: meta.singer || "Beyond",
-    albumName: "测试专辑",
-    interval: 240,
+    name:
+      meta.name ||
+      "海阔天空",
+
+    singer:
+      meta.singer ||
+      "Beyond",
+
+    albumName:
+      "测试专辑",
+
+    interval:
+      240,
+
     id: sid,
+
     songmid: sid,
+
     songId: sid,
+
     mid: sid,
+
     rid: sid,
+
     strMediaMid: sid,
+
     media_mid: sid,
-    hash: platform === "kg" ? sid : sid,
-    copyrightId: platform === "mg" ? sid : sid,
-    contentId: platform === "mg" ? sid : sid,
-    // 部分源会读这些
+
+    hash: sid,
+
+    copyrightId: sid,
+
+    contentId: sid,
+
     albumId: sid,
+
     source: platform
   };
+
+
+  // 酷狗
   if (platform === "kg") {
     info.hash = sid;
     info.kgHub = sid;
   }
+
+
+  // QQ音乐
   if (platform === "tx") {
     info.songmid = sid;
     info.mid = sid;
     info.strMediaMid = sid;
   }
+
+
+  // 酷我
   if (platform === "kw") {
     info.rid = sid;
     info.songmid = sid;
   }
+
+
+  // 网易云
   if (platform === "wy") {
     info.id = sid;
     info.songId = sid;
   }
+
+
+  // 咪咕
   if (platform === "mg") {
     info.copyrightId = sid;
     info.contentId = sid;
     info.songmid = sid;
   }
+
   return info;
 }
 
-// ---------- sandbox run ----------
+
+// ============================================================
+// 沙箱运行
+// ============================================================
+
 async function runScriptCheck(scriptText) {
   const start = Date.now();
+
   let requestHandler = null;
+
   let initedSources = null;
+
   let outboundCount = 0;
 
+
+  // ----------------------------------------------------------
+  // 创建沙箱环境
+  // ----------------------------------------------------------
+
   const sandbox = {
+
     console: {
       log: () => {},
       warn: () => {},
       error: () => {},
       info: () => {}
     },
+
     setTimeout,
     clearTimeout,
     setInterval,
     clearInterval,
+
     parseInt,
     parseFloat,
+
     isNaN,
+
     Number,
     String,
     Boolean,
+
     Array,
     Object,
+
     Math,
     Date,
+
     Error,
     Promise,
+
     JSON,
     RegExp,
+
     encodeURIComponent,
     decodeURIComponent,
+
     encodeURI,
     decodeURI,
+
     Buffer,
-    atob: (s) => Buffer.from(s, "base64").toString("binary"),
-    btoa: (s) => Buffer.from(s, "binary").toString("base64"),
+
+    atob: (s) =>
+      Buffer.from(
+        s,
+        "base64"
+      ).toString("binary"),
+
+    btoa: (s) =>
+      Buffer.from(
+        s,
+        "binary"
+      ).toString("base64"),
+
     URL,
+
     globalThis: null,
+
     global: null,
+
     window: null
   };
-  sandbox.globalThis = sandbox;
-  sandbox.global = sandbox;
-  sandbox.window = sandbox;
+
+
+  sandbox.globalThis =
+    sandbox;
+
+  sandbox.global =
+    sandbox;
+
+  sandbox.window =
+    sandbox;
+
+
+  // ----------------------------------------------------------
+  // 模拟 lx
+  // ----------------------------------------------------------
 
   sandbox.globalThis.lx = {
+
     EVENT_NAMES: {
       request: "request",
+
       inited: "inited",
-      updateAlert: "updateAlert"
+
+      updateAlert:
+        "updateAlert"
     },
-    version: "1.4.0",
-    env: "mobile",
-    currentScriptInfo: { name: "sandbox-check", version: "1.0.0" },
+
+
+    version:
+      "1.4.0",
+
+    env:
+      "mobile",
+
+
+    currentScriptInfo: {
+      name:
+        "sandbox-check",
+
+      version:
+        "1.0.0"
+    },
+
+
+    // --------------------------------------------------------
+    // 注册 request
+    // --------------------------------------------------------
+
     on(name, fn) {
-      if (name === "request" || name === sandbox.globalThis.lx.EVENT_NAMES.request) {
+
+      if (
+        name === "request" ||
+        name ===
+          sandbox.globalThis.lx
+            .EVENT_NAMES.request
+      ) {
         requestHandler = fn;
       }
     },
+
+
+    // --------------------------------------------------------
+    // 接收 inited
+    // --------------------------------------------------------
+
     send(name, data) {
-      if (name === "inited" || name === sandbox.globalThis.lx.EVENT_NAMES.inited) {
-        initedSources = data && data.sources ? Object.keys(data.sources) : null;
+
+      if (
+        name === "inited" ||
+        name ===
+          sandbox.globalThis.lx
+            .EVENT_NAMES.inited
+      ) {
+        initedSources =
+          data &&
+          data.sources
+            ? Object.keys(
+                data.sources
+              )
+            : null;
       }
     },
-    request(url, options, cb) {
+
+
+    // --------------------------------------------------------
+    // lx.request
+    // --------------------------------------------------------
+
+    request(
+      url,
+      options,
+      cb
+    ) {
+
       outboundCount++;
+
       if (outboundCount > 40) {
-        const err = new Error("出站请求过多");
-        if (typeof cb === "function") cb(err, null);
+
+        const err =
+          new Error(
+            "出站请求过多"
+          );
+
+        if (
+          typeof cb ===
+          "function"
+        ) {
+          cb(err, null);
+        }
+
         return;
       }
-      const u = String(url);
-      // 野草等会在初始化时拉远程配置，失败会抛「服务器异常」并可能拖垮进程
-      // 给配置类接口返回可用占位，让 musicUrl 仍可继续测
-      // 配置/信息类：失败会让野草抛「服务器异常」；占位让进程活着并尽量声明五平台
-      if (/grass-source|source-info|\/info\/|vinfo|mirror\.com|97\.64\.|source-info\/l/i.test(u) && !/\/url\//i.test(u)) {
+
+
+      const u =
+        String(url);
+
+
+      // ------------------------------------------------------
+      // 部分脚本初始化时会请求配置
+      // ------------------------------------------------------
+
+      if (
+        /grass-source|source-info|\/info\/|vinfo|mirror\.com|97\.64\.|source-info\/l/i
+          .test(u) &&
+        !/\/url\//i.test(u)
+      ) {
+
         const mock = {
+
           data: {
-            s: "kw|128k,320k,flac&kg|128k,320k,flac&tx|128k,320k,flac&wy|128k,320k,flac&mg|128k,320k,flac",
+
+            s:
+              "kw|128k,320k,flac&kg|128k,320k,flac&tx|128k,320k,flac&wy|128k,320k,flac&mg|128k,320k,flac",
+
             m: "",
+
             lv: "0",
+
             lu: "",
+
             lh: ""
           }
         };
-        if (typeof cb === "function") {
+
+
+        if (
+          typeof cb ===
+          "function"
+        ) {
+
           setTimeout(
-            () =>
-              cb(null, {
-                body: mock,
-                statusCode: 200,
-                headers: { "content-type": "application/json" }
-              }),
+            () => {
+
+              cb(
+                null,
+                {
+                  body:
+                    mock,
+
+                  statusCode:
+                    200,
+
+                  headers: {
+                    "content-type":
+                      "application/json"
+                  }
+                }
+              );
+
+            },
             0
           );
         }
+
         return;
       }
-      const method = (options && options.method) || "GET";
-      const headers = Object.assign(
-        {
-          "User-Agent": "lx-music-mobile/1.4.0"
-        },
-        (options && options.headers) || {}
-      );
-      let body = options && options.body;
-      if (body && typeof body === "object" && !Buffer.isBuffer(body)) {
-        body = JSON.stringify(body);
-        if (!headers["Content-Type"] && !headers["content-type"]) {
-          headers["Content-Type"] = "application/json";
+
+
+      // ------------------------------------------------------
+      // 正常请求
+      // ------------------------------------------------------
+
+      const method =
+        (
+          options &&
+          options.method
+        ) || "GET";
+
+
+      const headers =
+        Object.assign(
+
+          {
+            "User-Agent":
+              "lx-music-mobile/1.4.0"
+          },
+
+          (
+            options &&
+            options.headers
+          ) || {}
+        );
+
+
+      let body =
+        options &&
+        options.body;
+
+
+      if (
+        body &&
+        typeof body ===
+          "object" &&
+        !Buffer.isBuffer(body)
+      ) {
+
+        body =
+          JSON.stringify(body);
+
+        if (
+          !headers[
+            "Content-Type"
+          ] &&
+          !headers[
+            "content-type"
+          ]
+        ) {
+
+          headers[
+            "Content-Type"
+          ] =
+            "application/json";
         }
       }
-      fetchRaw(u, { method, headers, body, timeout: REQ_TIMEOUT_MS })
-        .then((res) => {
-          if (typeof cb === "function") {
-            cb(null, {
-              body: res.body,
-              statusCode: res.statusCode,
-              headers: res.headers
-            });
+
+
+      fetchRaw(
+        u,
+        {
+          method,
+          headers,
+          body,
+          timeout:
+            REQ_TIMEOUT_MS
+        }
+      )
+
+        .then(
+          (res) => {
+
+            if (
+              typeof cb ===
+              "function"
+            ) {
+
+              cb(
+                null,
+                {
+                  body:
+                    res.body,
+
+                  statusCode:
+                    res.statusCode,
+
+                  headers:
+                    res.headers
+                }
+              );
+            }
+
           }
-        })
-        .catch((err) => {
-          if (typeof cb === "function") cb(err, null);
-        });
+        )
+
+        .catch(
+          (err) => {
+
+            if (
+              typeof cb ===
+              "function"
+            ) {
+
+              cb(
+                err,
+                null
+              );
+            }
+
+          }
+        );
     },
+
+
+    // --------------------------------------------------------
+    // lx.utils
+    // --------------------------------------------------------
+
     utils: {
+
       crypto: {
+
         md5(s) {
-          return crypto.createHash("md5").update(String(s)).digest("hex");
+
+          return crypto
+            .createHash("md5")
+            .update(
+              String(s)
+            )
+            .digest("hex");
         },
+
+
         aesEncrypt() {
           return "";
         },
+
+
         rsaEncrypt() {
           return "";
         }
       },
+
+
       buffer: {
-        from(s, enc) {
-          return Buffer.from(s, enc || "utf8");
+
+        from(
+          s,
+          enc
+        ) {
+
+          return Buffer.from(
+            s,
+            enc || "utf8"
+          );
         },
-        bufToString(b, enc) {
-          return Buffer.from(b).toString(enc || "utf8");
+
+
+        bufToString(
+          b,
+          enc
+        ) {
+
+          return Buffer.from(
+            b
+          ).toString(
+            enc || "utf8"
+          );
         }
       }
     }
   };
 
-  // 执行脚本
+
+  // ==========================================================
+  // 执行音源脚本
+  // ==========================================================
+
   try {
-    vm.runInNewContext(scriptText, sandbox, {
-      timeout: VM_TIMEOUT_MS,
-      filename: "user-source.js"
-    });
+
+    vm.runInNewContext(
+      scriptText,
+      sandbox,
+      {
+        timeout:
+          VM_TIMEOUT_MS,
+
+        filename:
+          "user-source.js"
+      }
+    );
+
   } catch (e) {
+
     return {
+
       ok: false,
-      error: "脚本执行失败: " + (e.message || String(e)),
-      ms: Date.now() - start,
+
+      error:
+        "脚本执行失败: " +
+        (
+          e.message ||
+          String(e)
+        ),
+
+      ms:
+        Date.now() -
+        start,
+
       platformStatus: {},
+
       platformReasons: {}
     };
   }
 
-  // 等 inited（部分脚本异步拉配置 / 强混淆初始化较慢）
-  await new Promise((r) => setTimeout(r, 1500));
+
+  // ----------------------------------------------------------
+  // 等待脚本初始化
+  // ----------------------------------------------------------
+
+  await new Promise(
+    (resolve) =>
+      setTimeout(
+        resolve,
+        1500
+      )
+  );
+
+
+  // ----------------------------------------------------------
+  // 检查 request
+  // ----------------------------------------------------------
 
   if (!requestHandler) {
+
     return {
+
       ok: false,
-      error: "脚本未注册 request 处理（无 on(EVENT_NAMES.request)）",
-      ms: Date.now() - start,
+
+      error:
+        "脚本未注册 request 处理（无 on(EVENT_NAMES.request)）",
+
+      ms:
+        Date.now() -
+        start,
+
       platformStatus: {},
+
       platformReasons: {},
-      sources: initedSources
+
+      sources:
+        initedSources
     };
   }
 
+
+  // ----------------------------------------------------------
+  // 脚本声明的平台
+  // ----------------------------------------------------------
+
   const declared =
-    initedSources && initedSources.length
-      ? initedSources.filter((p) => CORE.includes(p))
+    initedSources &&
+    initedSources.length
+
+      ? initedSources.filter(
+          (p) =>
+            CORE.includes(p)
+        )
+
       : [...CORE];
 
-  const platformStatus = {};
-  const platformReasons = {};
-  // 方案 B：从当前脚本正文解析端点（仅脚本里出现过的）
-  const scriptEndpoints = parseScriptEndpoints(scriptText);
 
-  async function testOnePlatform(platform) {
-    if (declared.length && !declared.includes(platform)) {
-      platformStatus[platform] = "fail";
-      platformReasons[platform] = "脚本未声明该平台";
+  const platformStatus = {};
+
+  const platformReasons = {};
+
+
+  // ==========================================================
+  // 单个平台检测
+  // ==========================================================
+
+  async function testOnePlatform(
+    platform
+  ) {
+
+    // 如果脚本明确声明了平台，
+    // 但没有声明当前平台，则失败。
+    if (
+      declared.length &&
+      !declared.includes(
+        platform
+      )
+    ) {
+
+      platformStatus[
+        platform
+      ] = "fail";
+
+      platformReasons[
+        platform
+      ] =
+        "脚本未声明该平台";
+
       return;
     }
-    const ids = (TEST_BY_PLATFORM[platform] && TEST_BY_PLATFORM[platform].ids) || ["1"];
-    let lastErr = "取链失败";
 
-    // —— 1) 脚本内端点：失败换下一个，任一探活成功即绿 ——
-    const eps = scriptEndpoints.filter((e) => e.platform === platform).slice(0, 8);
-    for (const ep of eps) {
-      try {
-        if (await tryScriptEndpoint(ep, platform)) {
-          platformStatus[platform] = "ok";
-          platformReasons[platform] = "脚本内端点取链成功并已探活";
-          return;
-        }
-      } catch (_) {}
-    }
-    if (eps.length) {
-      lastErr = "脚本内端点均取链/探活失败";
-    } else {
-      lastErr = "脚本中未解析到该平台端点";
-    }
 
-    // —— 2) 仍失败则试 musicUrl（脚本运行时逻辑，也是脚本能力） ——
-    const qualities = ["128k"];
-    const deadline = Date.now() + PLATFORM_TIMEOUT_MS;
+    const meta =
+      TEST_BY_PLATFORM[
+        platform
+      ] || {};
+
+
+    // 最多三个测试 ID
+    const ids =
+      (
+        meta.ids ||
+        ["1"]
+      ).slice(
+        0,
+        3
+      );
+
+
+    const qualities =
+      ["128k"];
+
+
+    const deadline =
+      Date.now() +
+      PLATFORM_TIMEOUT_MS;
+
+
     let tries = 0;
-    outer: for (const id of ids) {
-      for (const quality of qualities) {
-        if (Date.now() > deadline || tries >= MAX_OUTBOUND_PER_PLATFORM) break outer;
+
+
+    let lastErr =
+      "musicUrl 未返回有效播放地址";
+
+
+    // --------------------------------------------------------
+    // 直接执行脚本 musicUrl
+    // --------------------------------------------------------
+
+    outer:
+
+    for (
+      const id of ids
+    ) {
+
+      for (
+        const quality of qualities
+      ) {
+
+        if (
+          Date.now() >
+            deadline ||
+          tries >=
+            MAX_OUTBOUND_PER_PLATFORM
+        ) {
+          break outer;
+        }
+
+
         tries++;
+
+
         try {
-          const result = await Promise.race([
-            Promise.resolve(
-              requestHandler({
-                action: "musicUrl",
-                source: platform,
-                info: {
-                  type: quality,
-                  musicInfo: buildMusicInfo(platform, id)
+
+          const result =
+            await Promise.race([
+
+              Promise.resolve(
+
+                requestHandler({
+
+                  action:
+                    "musicUrl",
+
+                  source:
+                    platform,
+
+                  info: {
+
+                    type:
+                      quality,
+
+                    musicInfo:
+                      buildMusicInfo(
+                        platform,
+                        id
+                      )
+                  }
+
+                })
+
+              ),
+
+
+              new Promise(
+                (
+                  _,
+                  reject
+                ) => {
+
+                  setTimeout(
+                    () => {
+
+                      reject(
+                        new Error(
+                          "musicUrl 超时"
+                        )
+                      );
+
+                    },
+
+                    PLATFORM_TIMEOUT_MS
+                  );
+
                 }
-              })
-            ),
-            new Promise((_, rej) =>
-              setTimeout(() => rej(new Error("musicUrl 超时")), PLATFORM_TIMEOUT_MS)
-            )
-          ]);
+              )
+            ]);
 
-          let playUrl = null;
-          if (typeof result === "string" && /^https?:\/\//i.test(result)) playUrl = result;
-          else if (result && typeof result === "object") playUrl = pickUrlFromBody(result);
 
-          if (playUrl && (await probePlayable(playUrl))) {
-            platformStatus[platform] = "ok";
-            platformReasons[platform] = "脚本 musicUrl 取链成功并已探活";
+          // --------------------------------------------------
+          // 提取播放 URL
+          // --------------------------------------------------
+
+          let playUrl =
+            null;
+
+
+          if (
+            typeof result ===
+            "string"
+          ) {
+
+            const t =
+              result.trim();
+
+            if (
+              /^https?:\/\//i
+                .test(t)
+            ) {
+
+              playUrl = t;
+            }
+
+          }
+
+          else if (
+            result &&
+            typeof result ===
+              "object"
+          ) {
+
+            playUrl =
+              pickUrlFromBody(
+                result
+              );
+          }
+
+
+          // --------------------------------------------------
+          // 核心判断
+          //
+          // 只要 musicUrl 返回有效 URL，
+          // 直接判定平台可用。
+          //
+          // 不再访问播放 URL 探活。
+          // --------------------------------------------------
+
+          if (
+            playUrl &&
+            /^https?:\/\//i
+              .test(playUrl)
+          ) {
+
+            platformStatus[
+              platform
+            ] = "ok";
+
+
+            platformReasons[
+              platform
+            ] =
+              "脚本 musicUrl 成功返回播放地址";
+
+
             return;
           }
-          if (playUrl) lastErr = "返回了地址但音频探活失败";
-          else lastErr = lastErr || "未返回有效播放地址";
-        } catch (e) {
-          lastErr = e && e.message ? String(e.message).slice(0, 120) : "调用失败";
-          if (/无法获取歌曲ID|缺少歌曲ID|没有找到|无效的id/i.test(lastErr)) break;
+
+
+          // 当前 ID 没拿到地址
+          lastErr =
+            "musicUrl 未返回有效播放地址";
+
+        }
+
+
+        catch (e) {
+
+          lastErr =
+            e &&
+            e.message
+
+              ? String(
+                  e.message
+                ).slice(
+                  0,
+                  160
+                )
+
+              : "musicUrl 调用失败";
+
+
+          // 某个测试 ID 无效，
+          // 继续尝试下一个 ID。
+          if (
+            /无法获取歌曲ID|缺少歌曲ID|没有找到|无效的id/i
+              .test(lastErr)
+          ) {
+
+            continue;
+          }
         }
       }
     }
 
-    platformStatus[platform] = "fail";
-    platformReasons[platform] = lastErr;
+
+    // --------------------------------------------------------
+    // 全部测试失败
+    // --------------------------------------------------------
+
+    platformStatus[
+      platform
+    ] = "fail";
+
+
+    platformReasons[
+      platform
+    ] =
+      lastErr;
   }
 
-  // 平台串行，避免免费实例打爆
-  for (const p of CORE) {
-    await testOnePlatform(p);
+
+  // ==========================================================
+  // 五个平台依次检测
+  // ==========================================================
+
+  for (
+    const p of CORE
+  ) {
+
+    await testOnePlatform(
+      p
+    );
   }
 
-  const statuses = declared.map((p) => platformStatus[p]).filter(Boolean);
+
+  // ==========================================================
+  // 总状态
+  // ==========================================================
+
+  const statuses =
+    declared
+      .map(
+        (p) =>
+          platformStatus[p]
+      )
+      .filter(Boolean);
+
+
   const overallStatus =
+
     statuses.length === 0
+
       ? "fail"
-      : statuses.every((s) => s === "ok")
+
+      : statuses.every(
+          (s) =>
+            s === "ok"
+        )
+
         ? "ok"
-        : statuses.some((s) => s === "ok")
+
+        : statuses.some(
+            (s) =>
+              s === "ok"
+          )
+
           ? "partial"
+
           : "fail";
 
+
   return {
+
     ok: true,
-    ms: Date.now() - start,
+
+    ms:
+      Date.now() -
+      start,
+
     name: null,
-    sources: declared,
-    platforms: declared,
+
+    sources:
+      declared,
+
+    platforms:
+      declared,
+
     platformStatus,
+
     platformReasons,
+
     overallStatus,
-    okPlatforms: Object.values(platformStatus).filter((s) => s === "ok").length,
-    totalPlatforms: CORE.length,
-    sourceType: "sandbox"
+
+    okPlatforms:
+      Object.values(
+        platformStatus
+      ).filter(
+        (s) =>
+          s === "ok"
+      ).length,
+
+    totalPlatforms:
+      CORE.length,
+
+    sourceType:
+      "sandbox"
   };
 }
 
-// ---------- HTTP server ----------
-function readBody(req, limit) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    req.on("data", (c) => {
-      size += c.length;
-      if (size > limit) {
-        reject(new Error("请求体过大"));
-        req.destroy();
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
-  });
+
+// ============================================================
+// HTTP Body
+// ============================================================
+
+function readBody(
+  req,
+  limit
+) {
+
+  return new Promise(
+    (
+      resolve,
+      reject
+    ) => {
+
+      const chunks = [];
+
+      let size = 0;
+
+
+      req.on(
+        "data",
+        (c) => {
+
+          size +=
+            c.length;
+
+
+          if (
+            size > limit
+          ) {
+
+            reject(
+              new Error(
+                "请求体过大"
+              )
+            );
+
+            req.destroy();
+
+            return;
+          }
+
+
+          chunks.push(c);
+        }
+      );
+
+
+      req.on(
+        "end",
+        () => {
+
+          resolve(
+            Buffer.concat(
+              chunks
+            )
+          );
+
+        }
+      );
+
+
+      req.on(
+        "error",
+        reject
+      );
+    }
+  );
 }
 
-function sendJson(res, code, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(code, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type"
-  });
+
+// ============================================================
+// JSON 输出
+// ============================================================
+
+function sendJson(
+  res,
+  code,
+  obj
+) {
+
+  const body =
+    JSON.stringify(
+      obj
+    );
+
+
+  res.writeHead(
+    code,
+    {
+
+      "Content-Type":
+        "application/json; charset=utf-8",
+
+      "Access-Control-Allow-Origin":
+        "*",
+
+      "Access-Control-Allow-Methods":
+        "GET, POST, OPTIONS",
+
+      "Access-Control-Allow-Headers":
+        "Content-Type"
+    }
+  );
+
+
   res.end(body);
 }
 
-const server = http.createServer(async (req, res) => {
-  if (req.method === "OPTIONS") {
-    res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type"
-    });
-    return res.end();
-  }
 
-  const url = new URL(req.url || "/", "http://localhost");
+// ============================================================
+// HTTP Server
+// ============================================================
 
-  if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/")) {
-    return sendJson(res, 200, {
-      ok: true,
-      service: "lx-source-sandbox",
-      usage: "POST /sandbox/check  { script: string }"
-    });
-  }
+const server =
+  http.createServer(
+    async (
+      req,
+      res
+    ) => {
 
-  if (req.method === "POST" && url.pathname === "/sandbox/check") {
-    try {
-      const raw = await readBody(req, SCRIPT_MAX + 64 * 1024);
-      let script = "";
-      let name = "";
-      const ct = (req.headers["content-type"] || "").toLowerCase();
-      if (ct.includes("application/json")) {
-        const j = JSON.parse(raw.toString("utf8") || "{}");
-        script = String(j.script || j.content || "");
-        name = String(j.name || "");
-      } else {
-        script = raw.toString("utf8");
+      // ------------------------------------------------------
+      // CORS OPTIONS
+      // ------------------------------------------------------
+
+      if (
+        req.method ===
+        "OPTIONS"
+      ) {
+
+        res.writeHead(
+          204,
+          {
+
+            "Access-Control-Allow-Origin":
+              "*",
+
+            "Access-Control-Allow-Methods":
+              "GET, POST, OPTIONS",
+
+            "Access-Control-Allow-Headers":
+              "Content-Type"
+          }
+        );
+
+        return res.end();
       }
-      if (!script || script.length < 50) {
-        return sendJson(res, 400, { ok: false, error: "请提供有效的音源脚本正文" });
+
+
+      const url =
+        new URL(
+          req.url ||
+            "/",
+          "http://localhost"
+        );
+
+
+      // ------------------------------------------------------
+      // Health
+      // ------------------------------------------------------
+
+      if (
+        req.method === "GET" &&
+        (
+          url.pathname ===
+            "/health" ||
+          url.pathname ===
+            "/"
+        )
+      ) {
+
+        return sendJson(
+          res,
+          200,
+          {
+
+            ok: true,
+
+            service:
+              "lx-source-sandbox",
+
+            usage:
+              "POST /sandbox/check  { \"script\": \"...\" }"
+          }
+        );
       }
-      if (script.length > SCRIPT_MAX) {
-        return sendJson(res, 400, { ok: false, error: "脚本过大（上限约 2MB）" });
+
+
+      // ------------------------------------------------------
+      // 沙箱检测
+      // ------------------------------------------------------
+
+      if (
+        req.method ===
+          "POST" &&
+        url.pathname ===
+          "/sandbox/check"
+      ) {
+
+        try {
+
+          const raw =
+            await readBody(
+              req,
+              SCRIPT_MAX +
+                64 * 1024
+            );
+
+
+          let script = "";
+
+          let name = "";
+
+
+          const ct =
+            (
+              req.headers[
+                "content-type"
+              ] || ""
+            ).toLowerCase();
+
+
+          if (
+            ct.includes(
+              "application/json"
+            )
+          ) {
+
+            const j =
+              JSON.parse(
+                raw.toString(
+                  "utf8"
+                ) || "{}"
+              );
+
+
+            script =
+              String(
+                j.script ||
+                j.content ||
+                ""
+              );
+
+
+            name =
+              String(
+                j.name ||
+                ""
+              );
+
+          }
+
+          else {
+
+            script =
+              raw.toString(
+                "utf8"
+              );
+          }
+
+
+          // --------------------------------------------------
+          // 检查脚本
+          // --------------------------------------------------
+
+          if (
+            !script ||
+            script.length < 50
+          ) {
+
+            return sendJson(
+              res,
+              400,
+              {
+                ok: false,
+
+                error:
+                  "请提供有效的音源脚本正文"
+              }
+            );
+          }
+
+
+          if (
+            script.length >
+            SCRIPT_MAX
+          ) {
+
+            return sendJson(
+              res,
+              400,
+              {
+                ok: false,
+
+                error:
+                  "脚本过大（上限约 2MB）"
+              }
+            );
+          }
+
+
+          // --------------------------------------------------
+          // 执行检测
+          // --------------------------------------------------
+
+          const result =
+            await runScriptCheck(
+              script
+            );
+
+
+          if (
+            name &&
+            result.ok
+          ) {
+
+            result.localName =
+              name;
+          }
+
+
+          return sendJson(
+            res,
+            200,
+            result
+          );
+
+        }
+
+
+        catch (e) {
+
+          return sendJson(
+            res,
+            500,
+            {
+
+              ok: false,
+
+              error:
+                e.message ||
+                "沙箱错误"
+            }
+          );
+        }
       }
-      const result = await runScriptCheck(script);
-      if (name && result.ok) result.localName = name;
-      return sendJson(res, 200, result);
-    } catch (e) {
-      return sendJson(res, 500, { ok: false, error: e.message || "沙箱错误" });
+
+
+      // ------------------------------------------------------
+      // 404
+      // ------------------------------------------------------
+
+      sendJson(
+        res,
+        404,
+        {
+          ok: false,
+          error:
+            "Not Found"
+        }
+      );
     }
+  );
+
+
+// ============================================================
+// 启动
+// ============================================================
+
+server.listen(
+  PORT,
+  () => {
+
+    console.log(
+      `[lx-source-sandbox] http://0.0.0.0:${PORT}`
+    );
+
+    console.log(
+      "  GET  /health"
+    );
+
+    console.log(
+      '  POST /sandbox/check  { "script": "..." }'
+    );
   }
-
-  sendJson(res, 404, { ok: false, error: "Not Found" });
-});
-
-server.listen(PORT, () => {
-  console.log(`[lx-source-sandbox] http://0.0.0.0:${PORT}`);
-  console.log(`  GET  /health`);
-  console.log(`  POST /sandbox/check  { "script": "..." }`);
-});
+);
