@@ -346,7 +346,9 @@ function parseScriptEndpoints(text) {
   return endpoints;
 }
 
-/** 测试「脚本正文里出现过的」单个端点 */
+/**
+ * 测试「脚本正文里出现过的」单个端点
+ */
 async function tryScriptEndpoint(ep, platform) {
   const meta = TEST_BY_PLATFORM[platform] || {};
   const ids = (meta.ids || ["1"]).slice(0, 2);
@@ -718,7 +720,7 @@ async function runScriptCheck(scriptText) {
             return;
           }
           if (playUrl) lastErr = "返回了地址但音频探活失败";
-          else lastErr = lastErr || "未返回有效播放地址";
+          else lastErr = "musicUrl 未返回有效播放地址";
         } catch (e) {
           lastErr = e && e.message ? String(e.message).slice(0, 120) : "调用失败";
           if (/无法获取歌曲ID|缺少歌曲ID|没有找到|无效的id/i.test(lastErr)) break;
@@ -726,8 +728,20 @@ async function runScriptCheck(scriptText) {
       }
     }
 
-    platformStatus[platform] = "fail";
-    platformReasons[platform] = lastErr;
+    // 酷我：脚本逻辑正确但 mobi.kuwo.cn 在境外网络不可达 → 标记 restricted（环境受限）
+    // 匹配：DNS 失败(ENOTFOUND)、连接拒绝(ECONNREFUSED)、超时(ETIMEDOUT/请求超时)、
+    //       连接重置(ECONNRESET)、网络不可达(unreachable) 且与 mobi.kuwo.cn 相关
+    const isKwNetworkBlocked = platform === "kw" && (
+      /mobi\.kuwo\.cn/i.test(lastErr) ||
+      /ENOTFOUND|ETIMEDOUT|ECONNREFUSED|ECONNRESET|ENETUNREACH|请求超时|connect timed out|network is unreachable/i.test(lastErr)
+    );
+    if (isKwNetworkBlocked) {
+      platformStatus[platform] = "restricted";
+      platformReasons[platform] = "环境受限/脚本正确但网络不通（mobi.kuwo.cn 境外不可达）";
+    } else {
+      platformStatus[platform] = "fail";
+      platformReasons[platform] = lastErr;
+    }
   }
 
   // 平台串行，避免免费实例打爆
@@ -741,7 +755,7 @@ async function runScriptCheck(scriptText) {
       ? "fail"
       : statuses.every((s) => s === "ok")
         ? "ok"
-        : statuses.some((s) => s === "ok")
+        : statuses.some((s) => s === "ok" || s === "restricted")
           ? "partial"
           : "fail";
 
@@ -755,6 +769,7 @@ async function runScriptCheck(scriptText) {
     platformReasons,
     overallStatus,
     okPlatforms: Object.values(platformStatus).filter((s) => s === "ok").length,
+    restrictedPlatforms: Object.values(platformStatus).filter((s) => s === "restricted").length,
     totalPlatforms: CORE.length,
     sourceType: "sandbox"
   };
@@ -845,3 +860,5 @@ server.listen(PORT, () => {
   console.log(`  GET  /health`);
   console.log(`  POST /sandbox/check  { "script": "..." }`);
 });
+
+module.exports = { runScriptCheck };
