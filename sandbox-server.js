@@ -1,15 +1,24 @@
 /**
- * 洛雪音源沙箱检测服务（可部署 Render / 本机）
+ * 洛雪音源沙箱检测服务 v2（可部署 Render / 本机）
  * - mock globalThis.lx，执行用户脚本
  * - 对 kw/kg/tx/wy/mg 调用 musicUrl
  * - 拦截 request / 返回值，探活音频地址
  *
- * POST /sandbox/check  { "script": "...", "name": "可选" }
+ * v2 改动：
+ *  1. SSRF 防护：所有出站请求（含重定向）先做 DNS 解析，命中内网段直接拒绝
+ *  2. 测试 ID 轮换：按脚本 sha256 决定本次用哪两个测试 ID，避免固定 ID 被限流/缓存污染
+ *  3. 清晰度矩阵：128k / 320k 都试一遍
+ *  4. search 冒烟测试：每个平台额外做一次搜索健康检查（单独返回，不影响 musicUrl 判定）
+ *  5. 结果缓存：按脚本 sha256 缓存 10 分钟，相同脚本直接返回缓存结果
+ *
+ * POST /sandbox/check  { "script": "...", "name": "可选", "nocache": true }
  * GET  /health
  */
 
 const http = require("http");
 const https = require("https");
+const dns = require("dns").promises;
+const net = require("net");
 const { URL } = require("url");
 const vm = require("vm");
 const crypto = require("crypto");
@@ -27,7 +36,87 @@ const SCRIPT_MAX = 2 * 1024 * 1024;
 const VM_TIMEOUT_MS = 10000;
 const REQ_TIMEOUT_MS = 8000;
 const PLATFORM_TIMEOUT_MS = 12000;
+const SEARCH_TIMEOUT_MS = 6000;
 const MAX_OUTBOUND_PER_PLATFORM = 8;
+const QUALITIES = ["128k", "320k"];
+
+// ---------- 结果缓存（按脚本 sha256，LRU + TTL） ----------
+const RESULT_CACHE = new Map();
+const CACHE_TTL_MS = 10 * 60 * 1000;
+const CACHE_MAX = 200;
+
+function cacheGet(hash) {
+  const hit = RESULT_CACHE.get(hash);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > CACHE_TTL_MS) {
+    RESULT_CACHE.delete(hash);
+    return null;
+  }
+  RESULT_CACHE.delete(hash); // LRU：命中后移到末尾
+  RESULT_CACHE.set(hash, hit);
+  return hit.result;
+}
+
+function cacheSet(hash, result) {
+  if (RESULT_CACHE.size >= CACHE_MAX) {
+    RESULT_CACHE.delete(RESULT_CACHE.keys().next().value);
+  }
+  RESULT_CACHE.set(hash, { ts: Date.now(), result });
+}
+
+// ---------- SSRF 防护：禁止出站到内网 ----------
+function isPrivateV4(ip) {
+  const p = ip.split(".").map(Number);
+  if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+  const [a, b] = p;
+  if (a === 10) return true; // 10.0.0.0/8
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16
+  if (a === 127) return true; // 127.0.0.0/8
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16（含云元数据 169.254.169.254）
+  if (a === 0) return true; // 0.0.0.0/8
+  return false;
+}
+
+function isPrivateIP(ip) {
+  const v = net.isIP(ip);
+  if (v === 4) return isPrivateV4(ip);
+  if (v === 6) {
+    const low = ip.toLowerCase();
+    if (low === "::1") return true;
+    if (low.startsWith("fe80:")) return true; // link-local
+    if (low.startsWith("fc") || low.startsWith("fd")) return true; // unique-local
+    const m = low.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/); // IPv4-mapped
+    if (m) return isPrivateV4(m[1]);
+    return false;
+  }
+  return true; // 不是合法 IP 字面量就直接拦，fail closed
+}
+
+const BLOCKED_HOST_RE = /(^|\.)(localhost|internal|local|lan|home|corp)$/i;
+
+async function assertUrlAllowed(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error("无效 URL");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("仅允许 http/https");
+  }
+  const host = parsed.hostname;
+  if (BLOCKED_HOST_RE.test(host)) throw new Error("禁止访问内网地址");
+  let addrs;
+  try {
+    addrs = await dns.lookup(host, { all: true });
+  } catch {
+    throw new Error("域名解析失败，拒绝出站");
+  }
+  if (!addrs.length || addrs.some((a) => isPrivateIP(a.address))) {
+    throw new Error("禁止访问内网地址");
+  }
+}
 
 const CORE = ["kw", "kg", "tx", "wy", "mg"];
 const PLATFORM_MAP = {
@@ -54,17 +143,22 @@ const TEST_BY_PLATFORM = {
   mg: { ids: ["600929000006724407", "600913000009337537", "600902000006889366"], name: "海阔天空", singer: "Beyond" }
 };
 
+/** 按脚本 hash 轮换测试 ID：每次取连续 2 个，避免固定 ID 被限流 */
+function pickTestIds(platform, scriptHash) {
+  const pool = (TEST_BY_PLATFORM[platform] && TEST_BY_PLATFORM[platform].ids) || ["1"];
+  const off = parseInt(String(scriptHash || "0").slice(0, 8), 16) % pool.length;
+  return [pool[off % pool.length], pool[(off + 1) % pool.length]];
+}
+
 // ---------- HTTP helpers ----------
-function fetchOnce(url, options = {}) {
+async function fetchOnce(url, options = {}) {
+  await assertUrlAllowed(url); // SSRF 拦截（含每次重定向都会走这里）
   return new Promise((resolve, reject) => {
     let parsed;
     try {
       parsed = new URL(url);
     } catch (e) {
       return reject(new Error("无效 URL"));
-    }
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      return reject(new Error("仅允许 http/https"));
     }
     const lib = parsed.protocol === "https:" ? https : http;
     const req = lib.request(
@@ -346,12 +440,10 @@ function parseScriptEndpoints(text) {
   return endpoints;
 }
 
-/**
- * 测试「脚本正文里出现过的」单个端点
- */
-async function tryScriptEndpoint(ep, platform) {
+/** 测试「脚本正文里出现过的」单个端点（ids 由调用方按脚本 hash 轮换传入） */
+async function tryScriptEndpoint(ep, platform, ids) {
   const meta = TEST_BY_PLATFORM[platform] || {};
-  const ids = (meta.ids || ["1"]).slice(0, 2);
+  const testIds = (ids && ids.length ? ids : (meta.ids || ["1"])).slice(0, 2);
   const jobs = [];
 
   if (ep.kind === "xinghai" && ep.base) {
@@ -363,13 +455,13 @@ async function tryScriptEndpoint(ep, platform) {
       }
     } catch (_) {}
     const source = ep.source || XINGHAI_SOURCE[platform] || platform;
-    for (const id of ids) {
+    for (const id of testIds) {
       jobs.push(
         `${base}?types=url&source=${encodeURIComponent(source)}&id=${encodeURIComponent(id)}&br=128`
       );
     }
   } else if (ep.kind === "id" && ep.base) {
-    for (const id of ids) {
+    for (const id of testIds) {
       jobs.push(`${ep.base}?id=${encodeURIComponent(id)}`);
     }
   } else if (ep.kind === "search-kw" && ep.base) {
@@ -379,11 +471,11 @@ async function tryScriptEndpoint(ep, platform) {
       );
     }
   } else if (ep.kind === "search" && ep.base) {
-    for (const id of ids) {
+    for (const id of testIds) {
       jobs.push(`${ep.base}?id=${encodeURIComponent(id)}`);
     }
   } else if (ep.kind === "php" && ep.template) {
-    const id = ids[0];
+    const id = testIds[0];
     for (const level of ["standard", "128k"]) {
       jobs.push(
         ep.template
@@ -468,7 +560,7 @@ function buildMusicInfo(platform, id) {
 }
 
 // ---------- sandbox run ----------
-async function runScriptCheck(scriptText) {
+async function runScriptCheck(scriptText, scriptHash) {
   const start = Date.now();
   let requestHandler = null;
   let initedSources = null;
@@ -665,14 +757,14 @@ async function runScriptCheck(scriptText) {
       platformReasons[platform] = "脚本未声明该平台";
       return;
     }
-    const ids = (TEST_BY_PLATFORM[platform] && TEST_BY_PLATFORM[platform].ids) || ["1"];
+    const ids = pickTestIds(platform, scriptHash);
     let lastErr = "取链失败";
 
     // —— 1) 脚本内端点：失败换下一个，任一探活成功即绿 ——
     const eps = scriptEndpoints.filter((e) => e.platform === platform).slice(0, 8);
     for (const ep of eps) {
       try {
-        if (await tryScriptEndpoint(ep, platform)) {
+        if (await tryScriptEndpoint(ep, platform, ids)) {
           platformStatus[platform] = "ok";
           platformReasons[platform] = "脚本内端点取链成功并已探活";
           return;
@@ -686,11 +778,10 @@ async function runScriptCheck(scriptText) {
     }
 
     // —— 2) 仍失败则试 musicUrl（脚本运行时逻辑，也是脚本能力） ——
-    const qualities = ["128k"];
     const deadline = Date.now() + PLATFORM_TIMEOUT_MS;
     let tries = 0;
     outer: for (const id of ids) {
-      for (const quality of qualities) {
+      for (const quality of QUALITIES) {
         if (Date.now() > deadline || tries >= MAX_OUTBOUND_PER_PLATFORM) break outer;
         tries++;
         try {
@@ -716,11 +807,11 @@ async function runScriptCheck(scriptText) {
 
           if (playUrl && (await probePlayable(playUrl))) {
             platformStatus[platform] = "ok";
-            platformReasons[platform] = "脚本 musicUrl 取链成功并已探活";
+            platformReasons[platform] = `脚本 musicUrl 取链成功并已探活（${quality}）`;
             return;
           }
           if (playUrl) lastErr = "返回了地址但音频探活失败";
-          else lastErr = "musicUrl 未返回有效播放地址";
+          else lastErr = lastErr || "未返回有效播放地址";
         } catch (e) {
           lastErr = e && e.message ? String(e.message).slice(0, 120) : "调用失败";
           if (/无法获取歌曲ID|缺少歌曲ID|没有找到|无效的id/i.test(lastErr)) break;
@@ -728,20 +819,41 @@ async function runScriptCheck(scriptText) {
       }
     }
 
-    // 酷我：脚本逻辑正确但 mobi.kuwo.cn 在境外网络不可达 → 标记 restricted（环境受限）
-    // 匹配：DNS 失败(ENOTFOUND)、连接拒绝(ECONNREFUSED)、超时(ETIMEDOUT/请求超时)、
-    //       连接重置(ECONNRESET)、网络不可达(unreachable) 且与 mobi.kuwo.cn 相关
-    const isKwNetworkBlocked = platform === "kw" && (
-      /mobi\.kuwo\.cn/i.test(lastErr) ||
-      /ENOTFOUND|ETIMEDOUT|ECONNREFUSED|ECONNRESET|ENETUNREACH|请求超时|connect timed out|network is unreachable/i.test(lastErr)
-    );
-    if (isKwNetworkBlocked) {
-      platformStatus[platform] = "restricted";
-      platformReasons[platform] = "环境受限/脚本正确但网络不通（mobi.kuwo.cn 境外不可达）";
-    } else {
-      platformStatus[platform] = "fail";
-      platformReasons[platform] = lastErr;
+    platformStatus[platform] = "fail";
+    platformReasons[platform] = lastErr;
+  }
+
+  /** search 冒烟测试：best-effort，结果单独返回，不影响 musicUrl 判定 */
+  async function testSearch(platform) {
+    const meta = TEST_BY_PLATFORM[platform] || {};
+    const keyword = meta.name || "海阔天空";
+    const shapes = [
+      { action: "search", source: platform, info: { keyword, page: 1 } },
+      { action: "search", source: platform, info: { query: keyword, page: 1 } }
+    ];
+    for (const payload of shapes) {
+      try {
+        const result = await Promise.race([
+          Promise.resolve(requestHandler(payload)),
+          new Promise((_, rej) =>
+            setTimeout(() => rej(new Error("search 超时")), SEARCH_TIMEOUT_MS)
+          )
+        ]);
+        const list = Array.isArray(result)
+          ? result
+          : result && Array.isArray(result.list)
+            ? result.list
+            : result && result.data && Array.isArray(result.data.list)
+              ? result.data.list
+              : result && Array.isArray(result.data)
+                ? result.data
+                : null;
+        if (list && list.length > 0) return { ok: true, count: list.length };
+      } catch (_) {
+        // 换下一种参数形状
+      }
     }
+    return { ok: false, reason: "搜索无结果或不支持 search action" };
   }
 
   // 平台串行，避免免费实例打爆
@@ -749,13 +861,35 @@ async function runScriptCheck(scriptText) {
     await testOnePlatform(p);
   }
 
+  // search 冒烟：并行跑，单独计时
+  const searchStatus = {};
+  const searchReasons = {};
+  try {
+    const results = await Promise.all(
+      declared.map(async (p) => {
+        try {
+          return [p, await testSearch(p)];
+        } catch (e) {
+          return [p, { ok: false, reason: String((e && e.message) || e).slice(0, 80) }];
+        }
+      })
+    );
+    for (const [p, r] of results) {
+      searchStatus[p] = r.ok ? "ok" : "fail";
+      searchReasons[p] = r.ok ? `搜索返回 ${r.count} 条` : r.reason;
+      if (!r.ok && platformStatus[p] === "ok") {
+        platformReasons[p] += "（搜索冒烟未通过）";
+      }
+    }
+  } catch (_) {}
+
   const statuses = declared.map((p) => platformStatus[p]).filter(Boolean);
   const overallStatus =
     statuses.length === 0
       ? "fail"
       : statuses.every((s) => s === "ok")
         ? "ok"
-        : statuses.some((s) => s === "ok" || s === "restricted")
+        : statuses.some((s) => s === "ok")
           ? "partial"
           : "fail";
 
@@ -763,13 +897,15 @@ async function runScriptCheck(scriptText) {
     ok: true,
     ms: Date.now() - start,
     name: null,
+    scriptHash: scriptHash || null,
     sources: declared,
     platforms: declared,
     platformStatus,
     platformReasons,
+    searchStatus,
+    searchReasons,
     overallStatus,
     okPlatforms: Object.values(platformStatus).filter((s) => s === "ok").length,
-    restrictedPlatforms: Object.values(platformStatus).filter((s) => s === "restricted").length,
     totalPlatforms: CORE.length,
     sourceType: "sandbox"
   };
@@ -821,7 +957,9 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       ok: true,
       service: "lx-source-sandbox",
-      usage: "POST /sandbox/check  { script: string }"
+      version: "v2",
+      usage: "POST /sandbox/check  { script: string, name?: string, nocache?: true }",
+      cache: { size: RESULT_CACHE.size, ttlMs: CACHE_TTL_MS }
     });
   }
 
@@ -830,13 +968,16 @@ const server = http.createServer(async (req, res) => {
       const raw = await readBody(req, SCRIPT_MAX + 64 * 1024);
       let script = "";
       let name = "";
+      let nocache = false;
       const ct = (req.headers["content-type"] || "").toLowerCase();
       if (ct.includes("application/json")) {
         const j = JSON.parse(raw.toString("utf8") || "{}");
         script = String(j.script || j.content || "");
         name = String(j.name || "");
+        nocache = !!j.nocache;
       } else {
         script = raw.toString("utf8");
+        nocache = url.searchParams.get("fresh") === "1";
       }
       if (!script || script.length < 50) {
         return sendJson(res, 400, { ok: false, error: "请提供有效的音源脚本正文" });
@@ -844,9 +985,21 @@ const server = http.createServer(async (req, res) => {
       if (script.length > SCRIPT_MAX) {
         return sendJson(res, 400, { ok: false, error: "脚本过大（上限约 2MB）" });
       }
-      const result = await runScriptCheck(script);
+
+      const scriptHash = crypto.createHash("sha256").update(script).digest("hex");
+
+      // 缓存命中直接返回
+      if (!nocache) {
+        const hit = cacheGet(scriptHash);
+        if (hit) {
+          return sendJson(res, 200, { ...hit, cached: true, ms: 0 });
+        }
+      }
+
+      const result = await runScriptCheck(script, scriptHash);
       if (name && result.ok) result.localName = name;
-      return sendJson(res, 200, result);
+      cacheSet(scriptHash, result); // 成功失败都缓存，hash 变了自然失效
+      return sendJson(res, 200, { ...result, cached: false });
     } catch (e) {
       return sendJson(res, 500, { ok: false, error: e.message || "沙箱错误" });
     }
@@ -856,9 +1009,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`[lx-source-sandbox] http://0.0.0.0:${PORT}`);
+  console.log(`[lx-source-sandbox v2] http://0.0.0.0:${PORT}`);
   console.log(`  GET  /health`);
-  console.log(`  POST /sandbox/check  { "script": "..." }`);
+  console.log(`  POST /sandbox/check  { "script": "...", "nocache": true }`);
 });
-
-module.exports = { runScriptCheck };
