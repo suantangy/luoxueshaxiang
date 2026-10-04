@@ -11,6 +11,10 @@
  *  4. search 冒烟测试：每个平台额外做一次搜索健康检查（单独返回，不影响 musicUrl 判定）
  *  5. 结果缓存：按脚本 sha256 缓存 10 分钟，相同脚本直接返回缓存结果
  *
+ * v2.1 改动：
+ *  6. 地域限制识别：DNS 命中保留段（198.18/15、100.64/10 等）直接拦截，不再空等超时；
+ *     脚本内二次请求因此失败的平台标为 limited（网络受限），而非 fail
+ *
  * POST /sandbox/check  { "script": "...", "name": "可选", "nocache": true }
  * GET  /health
  */
@@ -64,33 +68,42 @@ function cacheSet(hash, result) {
   RESULT_CACHE.set(hash, { ts: Date.now(), result });
 }
 
-// ---------- SSRF 防护：禁止出站到内网 ----------
-function isPrivateV4(ip) {
+// ---------- SSRF 防护 + 地域限制识别 ----------
+// 内网段与保留段（bogon）：公网 DNS 永远不该返回这些地址。
+// 命中保留段（如 198.18/15）基本意味着 DNS 污染/劫持，常见于有地域限制的国内域名在海外解析。
+function classifyV4(ip) {
+  // 返回 'private' | 'reserved' | null
   const p = ip.split(".").map(Number);
-  if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
-  const [a, b] = p;
-  if (a === 10) return true; // 10.0.0.0/8
-  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
-  if (a === 192 && b === 168) return true; // 192.168.0.0/16
-  if (a === 127) return true; // 127.0.0.0/8
-  if (a === 169 && b === 254) return true; // 169.254.0.0/16（含云元数据 169.254.169.254）
-  if (a === 0) return true; // 0.0.0.0/8
-  return false;
+  if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return "private";
+  const [a, b, c] = p;
+  if (a === 10) return "private"; // 10.0.0.0/8
+  if (a === 172 && b >= 16 && b <= 31) return "private"; // 172.16.0.0/12
+  if (a === 192 && b === 168) return "private"; // 192.168.0.0/16
+  if (a === 127) return "private"; // 127.0.0.0/8
+  if (a === 169 && b === 254) return "private"; // 169.254.0.0/16（含云元数据 169.254.169.254）
+  if (a === 0) return "private"; // 0.0.0.0/8
+  if (a === 100 && b >= 64 && b <= 127) return "reserved"; // 100.64.0.0/10 CGNAT
+  if (a === 198 && (b === 18 || b === 19)) return "reserved"; // 198.18.0.0/15 benchmarking
+  if (a === 192 && b === 0 && c === 2) return "reserved"; // 192.0.2.0/24 文档
+  if (a === 198 && b === 51 && c === 100) return "reserved"; // 198.51.100.0/24 文档
+  if (a === 203 && b === 0 && c === 113) return "reserved"; // 203.0.113.0/24 文档
+  if (a >= 240) return "reserved"; // 240.0.0.0/4 保留
+  return null;
 }
 
-function isPrivateIP(ip) {
+function classifyIP(ip) {
   const v = net.isIP(ip);
-  if (v === 4) return isPrivateV4(ip);
+  if (v === 4) return classifyV4(ip);
   if (v === 6) {
     const low = ip.toLowerCase();
-    if (low === "::1") return true;
-    if (low.startsWith("fe80:")) return true; // link-local
-    if (low.startsWith("fc") || low.startsWith("fd")) return true; // unique-local
     const m = low.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/); // IPv4-mapped
-    if (m) return isPrivateV4(m[1]);
-    return false;
+    if (m) return classifyV4(m[1]);
+    if (low === "::1" || low.startsWith("fe80:") || low.startsWith("fc") || low.startsWith("fd")) {
+      return "private";
+    }
+    return null;
   }
-  return true; // 不是合法 IP 字面量就直接拦，fail closed
+  return "private"; // 不是合法 IP 字面量就直接拦，fail closed
 }
 
 const BLOCKED_HOST_RE = /(^|\.)(localhost|internal|local|lan|home|corp)$/i;
@@ -113,9 +126,10 @@ async function assertUrlAllowed(url) {
   } catch {
     throw new Error("域名解析失败，拒绝出站");
   }
-  if (!addrs.length || addrs.some((a) => isPrivateIP(a.address))) {
-    throw new Error("禁止访问内网地址");
-  }
+  if (!addrs.length) throw new Error("域名解析失败，拒绝出站");
+  const kinds = new Set(addrs.map((a) => classifyIP(a.address)));
+  if (kinds.has("private")) throw new Error("禁止访问内网地址");
+  if (kinds.has("reserved")) throw new Error("解析到保留地址，拒绝出站（疑似 DNS 污染/地域限制）");
 }
 
 const CORE = ["kw", "kg", "tx", "wy", "mg"];
@@ -565,6 +579,7 @@ async function runScriptCheck(scriptText, scriptHash) {
   let requestHandler = null;
   let initedSources = null;
   let outboundCount = 0;
+  const netEnvIssues = []; // 脚本出站请求中遇到的网络环境问题：{host, reason, msg}
 
   const sandbox = {
     console: {
@@ -685,6 +700,14 @@ async function runScriptCheck(scriptText, scriptHash) {
           }
         })
         .catch((err) => {
+          const msg = (err && err.message) || String(err);
+          let host = "";
+          try {
+            host = new URL(u).hostname;
+          } catch (_) {}
+          if (/保留地址/.test(msg)) netEnvIssues.push({ host, reason: "bogon", msg });
+          else if (/域名解析失败/.test(msg)) netEnvIssues.push({ host, reason: "dns", msg });
+          else if (/请求超时/.test(msg)) netEnvIssues.push({ host, reason: "timeout", msg });
           if (typeof cb === "function") cb(err, null);
         });
     },
@@ -752,6 +775,7 @@ async function runScriptCheck(scriptText, scriptHash) {
   const scriptEndpoints = parseScriptEndpoints(scriptText);
 
   async function testOnePlatform(platform) {
+    const netMark = netEnvIssues.length; // 本平台测试开始前的网络问题水位，用于归因
     if (declared.length && !declared.includes(platform)) {
       platformStatus[platform] = "fail";
       platformReasons[platform] = "脚本未声明该平台";
@@ -819,8 +843,22 @@ async function runScriptCheck(scriptText, scriptHash) {
       }
     }
 
-    platformStatus[platform] = "fail";
-    platformReasons[platform] = lastErr;
+    // 失败归因：测试期间若遇到 bogon/DNS 类网络环境问题，标为 limited（网络受限）而非 fail
+    const freshIssues = netEnvIssues.slice(netMark);
+    const strongIssue = freshIssues.find((i) => i.reason === "bogon" || i.reason === "dns");
+    if (strongIssue) {
+      const hosts = [...new Set(freshIssues.map((i) => i.host).filter(Boolean))].join("、");
+      platformStatus[platform] = "limited";
+      platformReasons[platform] =
+        `网络环境受限（${hosts || "部分接口"}不可达，疑似地域限制，国内网络可能可用）。原始错误：${lastErr}`;
+    } else {
+      if (freshIssues.length) {
+        const hosts = [...new Set(freshIssues.map((i) => i.host).filter(Boolean))].join("、");
+        lastErr += `（检测期间 ${hosts} 出现网络超时，结果可能受网络波动影响）`;
+      }
+      platformStatus[platform] = "fail";
+      platformReasons[platform] = lastErr;
+    }
   }
 
   /** search 冒烟测试：best-effort，结果单独返回，不影响 musicUrl 判定 */
@@ -891,7 +929,9 @@ async function runScriptCheck(scriptText, scriptHash) {
         ? "ok"
         : statuses.some((s) => s === "ok")
           ? "partial"
-          : "fail";
+          : statuses.some((s) => s === "limited")
+            ? "limited"
+            : "fail";
 
   return {
     ok: true,
@@ -906,7 +946,9 @@ async function runScriptCheck(scriptText, scriptHash) {
     searchReasons,
     overallStatus,
     okPlatforms: Object.values(platformStatus).filter((s) => s === "ok").length,
+    limitedPlatforms: Object.values(platformStatus).filter((s) => s === "limited").length,
     totalPlatforms: CORE.length,
+    networkIssues: [...new Map(netEnvIssues.map((i) => [`${i.host}|${i.reason}`, i])).values()],
     sourceType: "sandbox"
   };
 }
@@ -957,7 +999,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       ok: true,
       service: "lx-source-sandbox",
-      version: "v2",
+      version: "v2.1",
       usage: "POST /sandbox/check  { script: string, name?: string, nocache?: true }",
       cache: { size: RESULT_CACHE.size, ttlMs: CACHE_TTL_MS }
     });
@@ -1009,7 +1051,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`[lx-source-sandbox v2] http://0.0.0.0:${PORT}`);
+  console.log(`[lx-source-sandbox v2.1] http://0.0.0.0:${PORT}`);
   console.log(`  GET  /health`);
   console.log(`  POST /sandbox/check  { "script": "...", "nocache": true }`);
 });
