@@ -925,16 +925,15 @@ async function runScriptCheck(scriptText, scriptHash) {
   } catch (_) {}
 
   const statuses = declared.map((p) => platformStatus[p]).filter(Boolean);
+  // 只要有一个平台可用，整体即为可用（无 partial 状态）
   const overallStatus =
     statuses.length === 0
       ? "fail"
-      : statuses.every((s) => s === "ok")
+      : statuses.some((s) => s === "ok")
         ? "ok"
-        : statuses.some((s) => s === "ok")
-          ? "partial"
-          : statuses.some((s) => s === "limited")
-            ? "limited"
-            : "fail";
+        : statuses.some((s) => s === "limited")
+          ? "limited"
+          : "fail";
 
   return {
     ok: true,
