@@ -802,8 +802,10 @@ async function runScriptCheck(scriptText, scriptHash) {
     }
 
     // —— 2) 仍失败则试 musicUrl（脚本运行时逻辑，也是脚本能力） ——
+    // 用独立的 musicErr 记录本阶段结论，避免静态阶段的旧原因残留误导
     const deadline = Date.now() + PLATFORM_TIMEOUT_MS;
     let tries = 0;
+    let musicErr = null;
     outer: for (const id of ids) {
       for (const quality of QUALITIES) {
         if (Date.now() > deadline || tries >= MAX_OUTBOUND_PER_PLATFORM) break outer;
@@ -834,14 +836,15 @@ async function runScriptCheck(scriptText, scriptHash) {
             platformReasons[platform] = `脚本 musicUrl 取链成功并已探活（${quality}）`;
             return;
           }
-          if (playUrl) lastErr = "返回了地址但音频探活失败";
-          else lastErr = lastErr || "未返回有效播放地址";
+          if (playUrl) musicErr = "返回了地址但音频探活失败";
+          else musicErr = "musicUrl 未返回有效播放地址";
         } catch (e) {
-          lastErr = e && e.message ? String(e.message).slice(0, 120) : "调用失败";
-          if (/无法获取歌曲ID|缺少歌曲ID|没有找到|无效的id/i.test(lastErr)) break;
+          musicErr = e && e.message ? String(e.message).slice(0, 120) : "调用失败";
+          if (/无法获取歌曲ID|缺少歌曲ID|没有找到|无效的id/i.test(musicErr)) break;
         }
       }
     }
+    if (musicErr) lastErr = musicErr;
 
     // 失败归因：测试期间若遇到 bogon/DNS 类网络环境问题，标为 limited（网络受限）而非 fail
     const freshIssues = netEnvIssues.slice(netMark);
